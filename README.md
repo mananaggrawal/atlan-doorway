@@ -5,95 +5,18 @@
 **Atlan Doorway is a git-backed control plane for AI-agent skills, tools,
 context, permissions and identity. Self-hosted and MCP-native.**
 
-One place where your company's AI skills, tool manuals and knowledge live —
+One place where a company's AI skills, tool manuals and knowledge live —
 centrally managed, reviewed and access-controlled, and usable from **any AI
 agent** that speaks MCP.
 
----
-
-## Quick start
-
-Three ways in, fastest first. All three end at the same place: your own
-instance, your own git repository, your team signing in.
-
-### 1. Deploy to Render (one click)
-
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/mananaggrawal/atlan-doorway)
-
-The blueprint in [`render.yaml`](render.yaml) provisions the web service and a
-Postgres database, and generates `JWT_SECRET` and `SECRETS_ENC_KEY` for you.
-Set `ADMIN_EMAIL` and `ADMIN_PASSWORD` when prompted and you are live.
-
-### 2. Docker Compose
-
-You need Docker with Compose, and an **empty git repository** on any host to
-hold your knowledge base — the app seeds it from a starter template on first
-run.
-
-```sh
-git clone https://github.com/mananaggrawal/atlan-doorway.git
-cd atlan-doorway
-cp .env.example .env
-```
-
-Fill the four required values in `.env`:
-
-```sh
-ADMIN_EMAIL=you@example.com     # the deployment owner, always an admin
-ADMIN_PASSWORD=pick-something   # only used when password login is on
-JWT_SECRET=…                    # node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
-SECRETS_ENC_KEY=…               # same command, run it again
-```
-
-Then:
-
-```sh
-docker compose up -d
-```
-
-Open **http://localhost:3001** and sign in. For a public deployment set
-`DOMAIN=doorway.your-domain.com` and start with `--profile https` — Caddy
-handles Let's Encrypt certificates and the HTTP→HTTPS redirect.
-
-### 3. From source
-
-Needs **Node 22.x** (the range is `>=22.13 <23` — not "22 or newer"; the
-`isolated-vm` native addon will not compile on Node 23+), pnpm 10, git ≥ 2.41
-and Postgres 17.
-
-```sh
-./run-local.sh
-```
-
-That script checks your Node version, finds or fetches the right pnpm,
-installs, starts the bundled Postgres and boots the app. See
-[GETTING-STARTED.md](GETTING-STARTED.md) for the full walkthrough.
+This is a private repository. It's the code, not a public project — see
+below for what it does and how to try the live instance.
 
 ---
 
-## Sign in with your organisation's Google account
+## Try it
 
-Doorway speaks standard OIDC, so Google Workspace sign-in is configuration,
-not code. Create an OAuth client in the Google Cloud console with the
-redirect URI `https://your-host/api/auth/oidc/callback`, then set:
-
-```sh
-OIDC_ISSUER_URL=https://accounts.google.com
-OIDC_CLIENT_ID=…apps.googleusercontent.com
-OIDC_CLIENT_SECRET=…
-OIDC_PROVIDER_LABEL=Sign in with Google
-ALLOWED_EMAIL_DOMAINS=your-company.com
-LOGIN_PASSWORD=false            # optional: SSO only, no passwords
-```
-
-Anyone at `your-company.com` can now sign in with their work Google account
-and is provisioned on first login; an admin assigns them roles from
-**Roles & Members**. `ALLOWED_EMAIL_DOMAINS` is not optional against Google —
-Google will authenticate anyone on earth, so the domain list is the boundary
-that keeps your deployment yours.
-
-The same block works for Entra, Okta, Auth0 or Keycloak; only the issuer URL
-changes.
+A running instance is live at **https://atlan-doorway.onrender.com/**.
 
 ---
 
@@ -121,16 +44,10 @@ role allows.
 loading them all: `list_skills` and `search` narrow the field, `get_skill`
 returns one skill at call time.
 
+**Sign-in.** Doorway speaks standard OIDC, so signing in with Google
+Workspace, Entra, Okta, Auth0 or Keycloak works as configuration, not code.
+
 ---
-
-## Documentation
-
-- **[GETTING-STARTED.md](GETTING-STARTED.md)** — first run, first skill, connecting an agent
-- **[Configuration](docs/configuration.md)** — every environment variable, SSO, backups, health
-- **[Skills in Cowork and claude.ai](docs/claude-cowork.md)**
-- **[Git sync](docs/git-sync.md)**
-- **[Troubleshooting](docs/troubleshooting.md)**
-- **[Upgrading](UPGRADING.md)**
 
 ## Repository layout
 
