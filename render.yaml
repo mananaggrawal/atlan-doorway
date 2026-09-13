@@ -1,0 +1,67 @@
+# Render blueprint — https://render.com/docs/blueprint-spec
+#
+# One click from the README provisions everything below: the app, a Postgres
+# instance, and generated secrets. After the first deploy, set DOMAIN to the
+# hostname Render gives you (e.g. atlan-doorway.onrender.com) so OAuth
+# redirects and cookie origins are built correctly, then redeploy.
+databases:
+  - name: atlan-doorway-db
+    databaseName: doorway
+    user: doorway
+    plan: basic-256mb
+
+services:
+  - type: web
+    name: atlan-doorway
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: atlan-doorway-db
+          property: connectionString
+
+      # Generated once by Render and never shown again. SECRETS_ENC_KEY
+      # encrypts the secrets vault at rest — if you ever rotate it, every
+      # stored secret must be re-entered.
+      - key: JWT_SECRET
+        generateValue: true
+      - key: SECRETS_ENC_KEY
+        generateValue: true
+
+      # The deployment owner. Always an admin.
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+
+      # Set to your Render hostname after the first deploy, without a scheme:
+      #   atlan-doorway.onrender.com
+      # Everything public (origins, OAuth redirect URIs) is derived from it.
+      - key: DOMAIN
+        sync: false
+
+      - key: PORT
+        value: 3001
+      - key: NODE_ENV
+        value: production
+      # Render terminates TLS one hop in front of the app, so rate limits and
+      # audit logs see real client IPs rather than the proxy's.
+      - key: TRUST_PROXY
+        value: 1
+
+      # --- Google Workspace sign-in (optional; see README) ---
+      # Redirect URI: https://<DOMAIN>/api/auth/oidc/callback
+      # ALLOWED_EMAIL_DOMAINS is REQUIRED with Google — it is the only thing
+      # stopping any Google account on earth from provisioning itself here.
+      - key: OIDC_ISSUER_URL
+        sync: false
+      - key: OIDC_CLIENT_ID
+        sync: false
+      - key: OIDC_CLIENT_SECRET
+        sync: false
+      - key: ALLOWED_EMAIL_DOMAINS
+        sync: false

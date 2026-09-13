@@ -1,0 +1,108 @@
+/**
+ * Library module — the CSS the components can't express in Tailwind.
+ *
+ * This file used to be a second design system: a game-feel layer from
+ * `mocks/mock-a2-game-library.html` with a teal accent, glossy status gems,
+ * 3D card tilt + pointer glare, spinning gear chrome, hover CTAs and particle
+ * flight — 331 lines and 106 raw hex values on its own radius and type scale.
+ *
+ * That direction was superseded by the flat prototype the app is migrating to
+ * (`skill-prototype-juan.html`), which has none of those things, so the layer
+ * was removed rather than re-tinted. What survives is the part that carries
+ * meaning rather than mood: the loadout slot animation (it shows an item
+ * arriving, which is otherwise invisible), the change-request dock entrance,
+ * and the diff marks.
+ *
+ * Everything below now reads from `shared/theme/tokens.css`. Keep it that way:
+ * a colour that isn't a token here is a colour nothing else can retheme.
+ */
+
+/* ── loadout slots ──
+   The list is not scrolled to when an item lands, so without the entrance the
+   add reads as "nothing happened". */
+.lib-slot {
+  animation: lib-slot-in 0.28s cubic-bezier(0.2, 1.4, 0.4, 1) both;
+}
+@keyframes lib-slot-in {
+  from {
+    opacity: 0;
+    transform: translateX(-22px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.lib-slot-leaving {
+  transition: all 0.18s ease-in;
+  opacity: 0;
+  transform: translateX(-18px) scale(0.95);
+}
+@keyframes lib-arrive {
+  0% {
+    box-shadow: 0 0 0 0 var(--color-ok);
+  }
+  60% {
+    box-shadow: 0 0 0 7px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+.lib-slot-arrive {
+  animation:
+    lib-slot-in 0.28s cubic-bezier(0.2, 1.4, 0.4, 1) both,
+    lib-arrive 0.5s ease-out 0.3s;
+}
+/* hover swaps the status dot for the remove button */
+.lib-slot .lib-slot-gem {
+  transition: opacity 0.15s;
+}
+.lib-slot:hover .lib-slot-gem {
+  opacity: 0;
+}
+.lib-slot .lib-slot-kick {
+  opacity: 0;
+  transition: all 0.15s;
+}
+.lib-slot:hover .lib-slot-kick {
+  opacity: 1;
+}
+.lib-count-pulse {
+  animation: lib-count-pulse 0.2s ease-out;
+}
+@keyframes lib-count-pulse {
+  50% {
+    transform: scale(1.35);
+  }
+}
+
+/* ── change-request dock (owners) ── */
+.lib-cr-dock {
+  animation: lib-cr-in 0.25s cubic-bezier(0.2, 1.2, 0.35, 1);
+}
+@keyframes lib-cr-in {
+  from {
+    opacity: 0;
+    transform: translateY(-50%) translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(-50%);
+  }
+}
+
+/* ── diff marks ──
+   `.lib-sug` moved to `../change-requests/change-requests.css` with the
+   change-request surfaces that use it (the components import it directly).
+   The per-line marks below are still Library-only. `mark-del` / `mark-ins`
+   are alpha, so they tint whatever row they land on instead of punching a
+   solid block through it. */
+.lib-line-removed {
+  background: var(--color-mark-del);
+  color: var(--color-danger);
+}
+.lib-line-added {
+  background: var(--color-mark-ins);
+  color: var(--color-ok);
+}

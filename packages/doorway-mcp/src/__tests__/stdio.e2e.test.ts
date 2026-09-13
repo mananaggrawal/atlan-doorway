@@ -1,0 +1,362 @@
+import { describe, expect, it, beforeAll, afterAll } from 'vitest';
+import http from 'node:http';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import AdmZip from 'adm-zip';
+import '@utcp/mcp'; // side effect: registers the 'mcp' call-template protocol
+import { CallTemplateSerializer, UtcpClientConfigSerializer } from '@utcp/sdk';
+import { CodeModeUtcpClient } from '@utcp/code-mode';
+import { registerManual } from '@atlan-doorway/platform-mcp-core';
+import { FALLBACKS_DIR, materializePlugin, prepareStdioSpec } from '../materialize.js';
+import type { DoorwayMcpConfig } from '../config.js';
+
+/**
+ * END-TO-END: the stdio runtime contract, at the process boundary.
+ *
+ * The unit tests pin expansion and containment as functions; this test pins
+ * the round-trip the risk review asked for: a plugin fetched from a (faked)
+ * deployment archive endpoint, materialized to real disk, its stdio server
+ * REALLY SPAWNED through the same UTCP mcp plugin `doorway-mcp` registers
+ * manuals with, and the contract asserted from INSIDE the child — the spawned
+ * process reports its own PLUGIN_ROOT, PLUGIN_DATA, cwd and env back through
+ * a tool call, so a regression in any layer (archive, materialization,
+ * expansion, spawn env) fails here even if every unit test still passes.
+ *
+ * Only the deployment's HTTP surface is faked, because the platform is not
+ * what is at risk; the zip, the disk, the subprocess and the MCP handshake
+ * are all real. The fixture server speaks raw newline-delimited JSON-RPC with
+ * ZERO dependencies — the materialized copy has no node_modules to import
+ * from, and needing none is what keeps the fixture honest.
+ */
+
+/** A minimal MCP stdio server: initialize, tools/list, tools/call(probe). */
+const FIXTURE_SERVER = `'use strict';
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
+rl.on('line', (line) => {
+  let req;
+  try { req = JSON.parse(line); } catch { return; }
+  if (req.method === 'initialize') {
+    send({ jsonrpc: '2.0', id: req.id, result: {
+      protocolVersion: req.params.protocolVersion,
+      capabilities: { tools: {} },
+      serverInfo: { name: 'probe-fixture', version: '0.0.0' },
+    }});
+  } else if (req.method === 'tools/list') {
+    send({ jsonrpc: '2.0', id: req.id, result: { tools: [{
+      name: 'probe',
+      description: 'Report the runtime contract as this process sees it.',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    }] } });
+  } else if (req.method === 'tools/call') {
+    send({ jsonrpc: '2.0', id: req.id, result: { content: [{ type: 'text', text: JSON.stringify({
+      pluginRoot: process.env.PLUGIN_ROOT ?? null,
+      pluginData: process.env.PLUGIN_DATA ?? null,
+      marker: process.env.MARKER ?? null,
+      unknown: process.env.UNKNOWN ?? null,
+      cwd: process.cwd(),
+    }) }] } });
+  } else if (req.id !== undefined) {
+    send({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: 'not implemented' } });
+  }
+});
+`;
+
+let httpServer: http.Server | null = null;
+let home = '';
+let priorDoorwayHome: string | undefined;
+let config: DoorwayMcpConfig;
+let client: CodeModeUtcpClient | null = null;
+
+beforeAll(async () => {
+  home = await fs.mkdtemp(path.join(os.tmpdir(), 'doorway-e2e-'));
+  priorDoorwayHome = process.env.DOORWAY_HOME;
+  process.env.DOORWAY_HOME = home;
+
+  // The faked deployment: ONLY the archive endpoint, serving a real zip.
+  const zip = new AdmZip();
+  zip.addFile('plugin.json', Buffer.from('{ "name": "gtm" }\n'));
+  zip.addFile(
+    'mcp.json',
+    Buffer.from(JSON.stringify({ mcpServers: { probe: { type: 'stdio', command: 'node' } } })),
+  );
+  // Plain mode, as the backend's archive route now passes it — adm-zip masks
+  // a numeric attr with 0xfff and positions it into the high bits itself.
+  zip.addFile('bin/server.cjs', Buffer.from(FIXTURE_SERVER), '', 0o755);
+  const archive = zip.toBuffer();
+
+  httpServer = http.createServer((req, res) => {
+    if (req.url?.startsWith('/api/agent/plugins/GTM/archive')) {
+      if (req.headers.authorization !== 'Bearer doorway_e2e') {
+        res.writeHead(401).end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/zip' }).end(archive);
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => httpServer!.listen(0, '127.0.0.1', resolve));
+  const port = (httpServer!.address() as { port: number }).port;
+  config = { baseUrl: `http://127.0.0.1:${port}`, connectionKey: 'doorway_e2e' };
+});
+
+afterAll(async () => {
+  await client?.close().catch(() => {});
+  if (httpServer) await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
+  // Restored, not deleted: a developer's own DOORWAY_HOME must survive the suite.
+  if (priorDoorwayHome === undefined) delete process.env.DOORWAY_HOME;
+  else process.env.DOORWAY_HOME = priorDoorwayHome;
+  await fs.rm(home, { recursive: true, force: true });
+});
+
+describe('stdio end-to-end', () => {
+  it(
+    'materializes the plugin, spawns the server, and the CHILD confirms the contract',
+    { timeout: 60_000 },
+    async () => {
+      const plugin = await materializePlugin(config, 'GTM');
+      // Byte-for-byte materialization, binaries-capable path included.
+      expect(await fs.readFile(path.join(plugin.pluginRoot, 'bin', 'server.cjs'), 'utf8')).toBe(
+        FIXTURE_SERVER,
+      );
+      // The exec bit survives the zip round trip — what lets a `./`-command
+      // stdio server actually run. Windows has no comparable mode bits, so
+      // the assertion is POSIX-only; the spawn below covers Windows.
+      if (process.platform !== 'win32') {
+        const mode = (await fs.stat(path.join(plugin.pluginRoot, 'bin', 'server.cjs'))).mode;
+        expect(mode & 0o111, 'materialized server lost its exec bit').toBeTruthy();
+      }
+      // A partial a hard-killed prior run left behind is reclaimed on the next
+      // materialization of the same folder — but only an OLD one: a fresh
+      // partial could be a concurrent instance's live download, and the sweep
+      // must leave it alone. A completed run leaves none of its own.
+      const keyDir = path.dirname(plugin.pluginRoot);
+      const stale = path.join(keyDir, '.GTM.zip.aaaaaaaaaaaa.partial');
+      const fresh = path.join(keyDir, '.GTM.zip.bbbbbbbbbbbb.partial');
+      await fs.writeFile(stale, 'junk');
+      const past = new Date(Date.now() - 11 * 60 * 1000);
+      await fs.utimes(stale, past, past);
+      await fs.writeFile(fresh, 'junk');
+      await materializePlugin(config, 'GTM');
+      const partials = (await fs.readdir(keyDir)).filter((f) => f.endsWith('.partial'));
+      expect(partials).toEqual(['.GTM.zip.bbbbbbbbbbbb.partial']);
+      await fs.rm(fresh, { force: true });
+
+      // The same preparation `prepareLocalManuals` applies before registration.
+      const spec = await prepareStdioSpec(
+        {
+          command: 'node',
+          args: ['${PLUGIN_ROOT}/bin/server.cjs'],
+          env: { MARKER: '${PLUGIN_DATA}/mark', UNKNOWN: '${NOPE}' },
+          cwd: '${PLUGIN_ROOT}',
+        },
+        plugin,
+      );
+      // The Agent Plugins rule stops HERE: our expansion touches exactly the
+      // two runtime placeholders and leaves the rest literal…
+      expect(spec.env?.UNKNOWN).toBe('${NOPE}');
+
+      // Registered through the SAME stack doorway-mcp uses: a UTCP mcp call
+      // template on a CodeModeUtcpClient — @utcp/mcp does the actual spawn.
+      const template = new CallTemplateSerializer().validateDict({
+        name: 'gtmprobe',
+        call_template_type: 'mcp',
+        config: { mcpServers: { probe: { transport: 'stdio', ...spec } } },
+      });
+      // …and UTCP takes over from there: a remaining `${VAR}` resolves from
+      // the client's variables under the manual's namespace — which is exactly
+      // how a local tool's credentials arrive from the MCP client config's env
+      // in the real doorway-mcp process.
+      client = await CodeModeUtcpClient.create(
+        process.cwd(),
+        new UtcpClientConfigSerializer().validateDict({
+          variables: { gtmprobe_NOPE: 'credential-from-launch-env' },
+        }),
+      );
+      const registered = await registerManual(client, template);
+      expect(registered).toEqual({ ok: true });
+
+      const tools = await client.getTools();
+      const probe = tools.find((t) => t.name.endsWith('probe'));
+      expect(probe, `no probe tool discovered; got: ${tools.map((t) => t.name).join(', ')}`).toBeTruthy();
+
+      // One real call, answered by the spawned process about ITSELF.
+      let last: unknown;
+      for await (const chunk of client.callToolStreaming(probe!.name, {})) last = chunk;
+      const text =
+        typeof last === 'string'
+          ? last
+          : ((last as { content?: { text?: string }[] })?.content?.[0]?.text ?? JSON.stringify(last));
+      const reported = JSON.parse(text) as Record<string, string | null>;
+
+      // Realpath both sides: the OS may hand the child a canonicalized cwd
+      // (macOS /tmp is a symlink), and the contract is about identity, not
+      // spelling.
+      const real = async (p: string | null) => (p ? fs.realpath(p).catch(() => p) : p);
+      expect(await real(reported.pluginRoot)).toBe(await real(plugin.pluginRoot));
+      expect(await real(reported.pluginData)).toBe(await real(plugin.pluginData));
+      expect(await real(reported.cwd)).toBe(await real(plugin.pluginRoot));
+      // env VALUES expand; unknown placeholders stay literal — per spec.
+      // Expansion is TEXTUAL (single, non-recursive) — the template wrote '/',
+      // so the child sees pluginData + '/mark' verbatim on every OS.
+      expect(reported.marker).toBe(`${plugin.pluginData}/mark`);
+      // The credential the launch env supplied arrived INSIDE the child.
+      expect(reported.unknown).toBe('credential-from-launch-env');
+
+      // Close HERE, not in afterAll: the child's cwd is inside the plugin
+      // root, and Windows refuses to remove a directory a live process holds
+      // — the later tests' cleanup would EBUSY against it.
+      await client.close();
+      client = null;
+    },
+  );
+
+  it('refuses to register a stdio server whose credential variable is missing', async () => {
+    // The flip side of the resolution above: a `${VAR}` nobody supplied is a
+    // REGISTRATION refusal naming the namespaced key — which is how a missing
+    // local credential presents to a doorway-mcp user, and registerManual's
+    // never-throw contract is what keeps it from taking the session down.
+    // A hand-built plugin dir: refusal happens before any spawn, and
+    // re-materializing GTM would race the previous test's teardown.
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'doorway-e2e-orphan-'));
+    try {
+      const plugin = { pluginRoot: path.join(dir, 'root'), pluginData: path.join(dir, 'data') };
+      await fs.mkdir(plugin.pluginRoot, { recursive: true });
+      await fs.mkdir(plugin.pluginData, { recursive: true });
+      const spec = await prepareStdioSpec(
+        { command: 'node', args: ['${PLUGIN_ROOT}/bin/server.cjs'], env: { KEY: '${ABSENT}' } },
+        plugin,
+      );
+      const bare = await CodeModeUtcpClient.create(
+        process.cwd(),
+        new UtcpClientConfigSerializer().validateDict({ variables: {} }),
+      );
+      try {
+        const result = await registerManual(
+          bare,
+          new CallTemplateSerializer().validateDict({
+            name: 'orphan',
+            call_template_type: 'mcp',
+            config: { mcpServers: { probe: { transport: 'stdio', ...spec } } },
+          }),
+        );
+        expect(result.ok).toBe(false);
+        if (!result.ok) expect(result.error).toContain('orphan_ABSENT');
+      } finally {
+        await bare.close().catch(() => {});
+      }
+    } finally {
+      // Per-test dirs get per-test cleanup — the shared afterAll only owns `home`.
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an escaping cwd within the same composed flow', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'doorway-e2e-escape-'));
+    try {
+      const plugin = { pluginRoot: path.join(dir, 'root'), pluginData: path.join(dir, 'data') };
+      await fs.mkdir(plugin.pluginRoot, { recursive: true });
+      await fs.mkdir(plugin.pluginData, { recursive: true });
+      await expect(
+        prepareStdioSpec({ command: 'node', args: [], cwd: '../../outside' }, plugin),
+      ).rejects.toThrow(/escapes the plugin root|does not exist/);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it(
+    'tolerates a HELD canonical root — sibling fallback on Windows — and sweeps stale fallbacks',
+    { timeout: 60_000 },
+    async () => {
+      const first = await materializePlugin(config, 'GTM');
+      const keyDir = path.dirname(first.pluginRoot);
+      // Fallback roots live in the RESERVED namespace, keyed by plugin —
+      // never as keyDir siblings a plugin folder's name could collide with.
+      const fallbacksDir = path.join(keyDir, FALLBACKS_DIR, 'GTM');
+
+      // Stale + fresh fallback roots, as a hard-killed prior run leaves them.
+      // Contents FIRST, utimes after — adding an entry would bump the dir's
+      // mtime back inside the age gate.
+      const stale = path.join(fallbacksDir, 'aaaaaaaaaaaa');
+      const fresh = path.join(fallbacksDir, 'bbbbbbbbbbbb');
+      await fs.mkdir(stale, { recursive: true });
+      await fs.writeFile(path.join(stale, 'junk.txt'), 'junk');
+      const past = new Date(Date.now() - 11 * 60 * 1000);
+      await fs.utimes(stale, past, past);
+      await fs.mkdir(fresh, { recursive: true });
+      // The ambiguity the namespace exists to remove: a LEGITIMATE plugin
+      // whose folder merely looks like an old-style fallback sibling. However
+      // old it is, no sweep may ever touch it.
+      const lookalike = path.join(keyDir, 'GTM.abcdef123456');
+      await fs.mkdir(lookalike, { recursive: true });
+      await fs.writeFile(path.join(lookalike, 'plugin.json'), '{ "name": "lookalike" }\n');
+      await fs.utimes(lookalike, past, past);
+
+      // A REAL holder: a live process whose cwd sits inside the canonical
+      // root — exactly what an orphaned stdio server from a previous instance
+      // does. On Windows that makes the refresh rm fail EBUSY (the observed
+      // bug); POSIX unlinks a held directory without complaint, so the
+      // fallback assertions are win32-only while the sweep ones hold anywhere.
+      // Wait for the holder's JS to RUN, not merely for 'spawn': on Windows
+      // the cwd handle is opened during child-side process initialization, so
+      // right after CreateProcess there is a window (long under load) where
+      // the directory is not yet held and the refresh rm sails through.
+      const holder = spawn(
+        process.execPath,
+        ['-e', 'process.stdout.write("held\\n"); setInterval(() => {}, 1000)'],
+        { cwd: first.pluginRoot, stdio: ['ignore', 'pipe', 'ignore'] },
+      );
+      await new Promise<void>((resolve, reject) => {
+        holder.stdout!.once('data', () => resolve());
+        holder.once('error', reject);
+        holder.once('exit', () => reject(new Error('holder exited before holding')));
+      });
+      try {
+        const second = await materializePlugin(config, 'GTM');
+        // PLUGIN_DATA stays canonical either way — state is shared by design.
+        expect(second.pluginData).toBe(first.pluginData);
+        // The fresh bytes landed wherever the root ended up.
+        expect(await fs.readFile(path.join(second.pluginRoot, 'bin', 'server.cjs'), 'utf8')).toBe(
+          FIXTURE_SERVER,
+        );
+        if (process.platform === 'win32') {
+          // The fix: a fallback root in the reserved namespace instead of
+          // `skipping local server (EBUSY)`.
+          expect(second.pluginRoot).not.toBe(first.pluginRoot);
+          expect(path.dirname(second.pluginRoot)).toBe(fallbacksDir);
+          expect(path.basename(second.pluginRoot)).toMatch(/^[0-9a-f]{12}$/);
+        } else {
+          // The fast path stays byte-identical when the rm succeeds.
+          expect(second.pluginRoot).toBe(first.pluginRoot);
+        }
+        // The sweep inside the namespace: the stale fallback is reclaimed, the
+        // fresh one (a possibly-live concurrent instance) is not — and neither
+        // is this run's own root, wherever it landed.
+        const swept = await fs.readdir(fallbacksDir);
+        expect(swept).not.toContain('aaaaaaaaaaaa');
+        expect(swept).toContain('bbbbbbbbbbbb');
+        if (process.platform === 'win32') {
+          expect(swept).toContain(path.basename(second.pluginRoot));
+        }
+        // …and the fallback-shaped PLUGIN folder outside the namespace is
+        // untouched, old as it is: the sweep has no reach into keyDir.
+        expect(await fs.readdir(keyDir)).toContain('GTM.abcdef123456');
+        expect(
+          await fs.readFile(path.join(lookalike, 'plugin.json'), 'utf8'),
+        ).toContain('lookalike');
+      } finally {
+        holder.kill();
+        // The holder must be GONE before afterAll's rm of the whole home —
+        // Windows would EBUSY against its cwd otherwise.
+        await new Promise<void>((resolve) => holder.once('exit', () => resolve()));
+        await fs.rm(fresh, { recursive: true, force: true });
+        await fs.rm(lookalike, { recursive: true, force: true });
+      }
+    },
+  );
+});

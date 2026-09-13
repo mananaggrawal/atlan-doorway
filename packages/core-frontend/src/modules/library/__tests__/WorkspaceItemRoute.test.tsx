@@ -1,0 +1,758 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import type { ReactNode } from 'react';
+import { DEFAULT_BRANCH, type FileTreeEntry } from '@atlan-doorway/platform-shared';
+import {
+  WorkspaceContext,
+  type WorkspaceContextValue,
+} from '../../workspace/state/workspace.context';
+import { AdminContext } from '../../admin/state/admin.context';
+import type { LibraryData } from '../hooks/useLibraryData';
+
+/**
+ * The canonical /workspace item URLs, rendered INSIDE the library surface:
+ * dispatch is by URL shape (`isLibraryLocation` — the shell's rule), page
+ * resolution by catalog, and the catalog answering "not yet" holds the slot
+ * instead of surrendering the surface. The item pages themselves are mocked
+ * to markers; their behaviour lives in their own test files.
+ */
+
+const dataMock = vi.hoisted(() => ({ useLibraryData: vi.fn() }));
+vi.mock('../hooks/useLibraryData', () => ({ useLibraryData: dataMock.useLibraryData }));
+
+vi.mock('../services/teams.api', () => ({ listTeams: vi.fn().mockResolvedValue([]) }));
+// The sidebar's change-request dock pulls in git wiring these routes do not exercise.
+vi.mock('../../git/components/PullRequestsForMe', () => ({ PullRequestsForMe: () => null }));
+vi.mock('../services/plugins.api', () => ({
+  listPlugins: vi.fn().mockResolvedValue([]),
+  listJoinRequests: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock('../components/skill-page/SkillPage', () => ({
+  SkillPage: ({ name, activeFile }: { name?: string; activeFile?: string }) => (
+    <div aria-label="skill-page">{`${name}::${activeFile}`}</div>
+  ),
+}));
+vi.mock('../components/tool-page/ToolPage', () => ({
+  ToolPage: ({ slug }: { slug?: string }) => <div aria-label="tool-page">{slug}</div>,
+}));
+// The Knowledge file route, rendered by the item route for a loose file:
+// its own behaviour lives with the workspace tests.
+vi.mock('../../workspace/components/FileRoute', () => ({
+  FileRoute: ({ canonicalize }: { canonicalize?: boolean }) => (
+    <div aria-label="file-view">{`canonicalize:${String(canonicalize)}`}</div>
+  ),
+}));
+
+import { LibraryRoutes } from '../routes/LibraryRoutes';
+import { isLibraryLocation } from '../routes/library-paths';
+import { listPlugins, type PluginSummary } from '../services/plugins.api';
+import { withAuth } from './auth-harness';
+
+/** A listed plugin whose folder is `Plugins/Sales` and whose identity is `sales`. */
+const SALES: PluginSummary = {
+  name: 'sales',
+  displayName: 'Sales',
+  folders: ['Plugins/Sales'],
+  canRead: true,
+  canWrite: false,
+  isOwner: false,
+  linksAreManaged: true,
+  skillCount: 1,
+  toolCount: 0,
+  brokenLinks: 0,
+  owners: { roles: [], users: [] },
+  writers: { roles: [], users: [] },
+  readers: { restricted: true, roles: [], users: [] },
+  hasRequested: false,
+  requestNumber: null,
+};
+
+const CATALOG: LibraryData = {
+  loading: false,
+  error: null,
+  skills: [
+    { name: 'create-sales-deck', description: '', path: 'Plugins/Sales/create-sales-deck' },
+  ],
+  pendingSkills: [],
+  tools: [
+    {
+      slug: 'notion',
+      name: 'notion',
+      path: 'Plugins/Support/notion.tool',
+      type: 'mcp',
+      setup: null,
+      canWrite: false,
+      variables: [],
+    },
+  ],
+  ownedSkills: new Set<string>(),
+  allowedToolsBySkill: new Map(),
+  crs: [],
+  myCrNumbers: new Set<number>(),
+  reload: vi.fn(),
+};
+
+const KB = 'knowledge-base';
+
+function wrap(children: ReactNode, fileTree: FileTreeEntry | null = null) {
+  const adminValue = {
+    isAdmin: false,
+    unreadCount: 0,
+    lastSeen: null,
+    markSeen: vi.fn(),
+    refresh: vi.fn(),
+    rolesConfigCorrupted: false,
+    rolesConfigErrors: [],
+    runRolesRecovery: vi.fn(),
+  };
+  const workspaceValue = {
+    workspaceId: 'ws',
+    kbDirName: KB,
+    fileTree,
+    pendingUploads: new Map(),
+  } as unknown as WorkspaceContextValue;
+  return (
+    <AdminContext.Provider value={adminValue}>
+      <WorkspaceContext.Provider value={workspaceValue}>
+        {withAuth(children)}
+      </WorkspaceContext.Provider>
+    </AdminContext.Provider>
+  );
+}
+
+function LocationProbe() {
+  const location = useLocation();
+  const rawFile = (location.state as { rawFile?: boolean } | null)?.rawFile === true;
+  return (
+    <>
+      <div aria-label="pathname">{location.pathname}</div>
+      <div aria-label="hash">{location.hash}</div>
+      <div aria-label="raw-file">{String(rawFile)}</div>
+    </>
+  );
+}
+
+function renderAt(url: string, fileTree: FileTreeEntry | null = null) {
+  // The same two mounts the shell's CoreSurfaces gives this surface.
+  return render(
+    <MemoryRouter initialEntries={[url]}>
+      {wrap(
+        <Routes>
+          <Route path="/skills-and-tools/*" element={<LibraryRoutes />} />
+          <Route path="/workspace/*" element={<LibraryRoutes />} />
+        </Routes>,
+        fileTree,
+      )}
+      <LocationProbe />
+    </MemoryRouter>,
+  );
+}
+
+const itemUrl = (repoRel: string, branch = DEFAULT_BRANCH) =>
+  `/workspace/${encodeURIComponent(branch)}/${KB}/${repoRel
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/')}`;
+
+beforeEach(() => {
+  dataMock.useLibraryData.mockReturnValue(CATALOG);
+  vi.mocked(listPlugins).mockResolvedValue([]);
+});
+
+describe('WorkspaceItemRoute', () => {
+  it("a skill file's URL renders the skill page on that file's tab, inside the library nav", async () => {
+    renderAt(itemUrl('Plugins/Sales/create-sales-deck/reference/LESSONS.md'));
+    expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+      'create-sales-deck::reference/LESSONS.md',
+    );
+    // The ONE library sidebar is on screen with it — same surface, not a copy.
+    expect(screen.getByRole('button', { name: /^Everything/ })).toBeInTheDocument();
+  });
+
+  it('a bare skill-folder URL opens SKILL.md', async () => {
+    renderAt(itemUrl('Plugins/Sales/create-sales-deck'));
+    expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+      'create-sales-deck::SKILL.md',
+    );
+  });
+
+  it("a `.tool` manual's URL renders the tool page", async () => {
+    renderAt(itemUrl('Plugins/Support/notion.tool'));
+    expect(await screen.findByLabelText('tool-page')).toHaveTextContent('notion');
+  });
+
+  it('resolves a skill from the URL alone — a just-created skill needs no catalog', async () => {
+    // The regression this exists for: right after "create empty skill" the
+    // catalog reload hasn't landed. Resolution is structural (the folder name
+    // IS the skill id), so the page opens instantly anyway.
+    dataMock.useLibraryData.mockReturnValue({ ...CATALOG, loading: true, skills: [], tools: [] });
+    renderAt(itemUrl('Plugins/Sales/brand-new-skill/SKILL.md'));
+    expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+      'brand-new-skill::SKILL.md',
+    );
+    // …inside the library surface, never the Knowledge view.
+    expect(screen.getByRole('button', { name: /^Everything/ })).toBeInTheDocument();
+  });
+
+  it("a `.tool` URL falls back to the filename slug when the catalog hasn't loaded", async () => {
+    dataMock.useLibraryData.mockReturnValue({ ...CATALOG, loading: true, skills: [], tools: [] });
+    renderAt(itemUrl('Plugins/Support/notion.tool'));
+    expect(await screen.findByLabelText('tool-page')).toHaveTextContent('notion');
+  });
+
+  it('router state `rawFile` renders the file itself at a URL that would otherwise be a page — still inside the library', async () => {
+    // The tool page's "Edit the tool file" and the plugin page's manifest
+    // button ask for the raw editor by state; the app on screen does not
+    // change.
+    render(
+      <MemoryRouter initialEntries={[{ pathname: itemUrl('Plugins/Support/notion.tool'), state: { rawFile: true } }]}>
+        {wrap(
+          <Routes>
+            <Route path="/workspace/*" element={<LibraryRoutes />} />
+          </Routes>,
+          null,
+        )}
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+    expect(screen.queryByLabelText('tool-page')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Everything/ })).toBeInTheDocument();
+    // A `.tool` carries a frontmatter id — the very case the id redirect
+    // would have bounced back to Knowledge.
+    expect(screen.getByLabelText('file-view')).toHaveTextContent('canonicalize:false');
+  });
+
+  it("a plugin's own file — its access.md — opens as the plain file it is, INSIDE the library frame, not the plugin page", async () => {
+    // The page keys on the plugin's IDENTITY, which the folder name need not
+    // be (a personal space, a folder spelled unlike its manifest), so the old
+    // bounce landed on "doesn't exist" for a file plainly there. The file
+    // route renders here: same URL, no navigation, no router state, and the
+    // library's own nav still around it — which app a file opens in follows
+    // the folder it is in.
+    renderAt(itemUrl('Plugins/Sales/access.md'));
+    await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+    expect(screen.getByLabelText('pathname')).toHaveTextContent(itemUrl('Plugins/Sales/access.md'));
+    expect(screen.getByLabelText('raw-file')).toHaveTextContent('false');
+    // The file route must not replace the path with a node-id URL here: an id
+    // URL is no library location, and the surface would switch after all.
+    expect(screen.getByLabelText('file-view')).toHaveTextContent('canonicalize:false');
+    expect(screen.getByRole('button', { name: /^Everything/ })).toBeInTheDocument();
+    expect(screen.queryByLabelText('skill-page')).not.toBeInTheDocument();
+  });
+
+  describe("a file inside a listed plugin", () => {
+    it("the manifest opens as the file, with a note naming the plugin and a link to its page", async () => {
+      vi.mocked(listPlugins).mockResolvedValue([SALES]);
+      renderAt(itemUrl('Plugins/Sales/plugin.json'));
+      await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+      // The file, at its own URL — no jump to the page.
+      expect(screen.getByLabelText('pathname')).toHaveTextContent(itemUrl('Plugins/Sales/plugin.json'));
+      // The note names the plugin as people know it and links by its identity.
+      expect(await screen.findByText('Sales')).toBeInTheDocument();
+      expect(screen.getByRole('link', { name: 'Open plugin' })).toHaveAttribute('href', '/skills-and-tools/plugins/sales');
+    });
+
+    it("the bundle dialect's manifest and the plugin's access.md carry the same note", async () => {
+      vi.mocked(listPlugins).mockResolvedValue([{ ...SALES, linksAreManaged: false }]);
+      renderAt(itemUrl('Plugins/Sales/plugin.bundle.json'));
+      expect(await screen.findByRole('link', { name: 'Open plugin' })).toHaveAttribute('href', '/skills-and-tools/plugins/sales');
+      cleanup();
+      vi.mocked(listPlugins).mockResolvedValue([SALES]);
+      renderAt(itemUrl('Plugins/Sales/access.md'));
+      expect(await screen.findByRole('link', { name: 'Open plugin' })).toHaveAttribute('href', '/skills-and-tools/plugins/sales');
+    });
+
+    it('shows the file at once but the note only from a settled plugin list', async () => {
+      // A stale list could name the wrong plugin for a frame; the file waits
+      // for nothing, the note does.
+      let answer: (plugins: PluginSummary[]) => void = () => {};
+      vi.mocked(listPlugins).mockReturnValue(new Promise<PluginSummary[]>((r) => (answer = r)));
+      renderAt(itemUrl('Plugins/Sales/plugin.json'));
+      await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+      expect(screen.queryByRole('link', { name: 'Open plugin' })).not.toBeInTheDocument();
+      answer([SALES]);
+      expect(await screen.findByRole('link', { name: 'Open plugin' })).toHaveAttribute('href', '/skills-and-tools/plugins/sales');
+    });
+
+    it('a file in a folder no listed plugin holds gets no note — the file alone', async () => {
+      renderAt(itemUrl('Plugins/Nope/plugin.json'));
+      await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+      expect(screen.queryByRole('link', { name: 'Open plugin' })).not.toBeInTheDocument();
+    });
+
+    it("a manifest bundled inside a SKILL stays that skill's file", async () => {
+      vi.mocked(listPlugins).mockResolvedValue([SALES]);
+      renderAt(itemUrl('Plugins/Sales/create-sales-deck/plugin.json'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent('create-sales-deck::plugin.json');
+    });
+
+    it('a sibling folder sharing a prefix with the plugin does not claim the file', async () => {
+      vi.mocked(listPlugins).mockResolvedValue([SALES]);
+      renderAt(itemUrl('Plugins/Sales-Team/plugin.json'));
+      await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+      expect(screen.queryByRole('link', { name: 'Open plugin' })).not.toBeInTheDocument();
+    });
+
+    it('router state `rawFile` opens the manifest as a file with the same note — the page’s Manifest button', async () => {
+      vi.mocked(listPlugins).mockResolvedValue([SALES]);
+      render(
+        <MemoryRouter initialEntries={[{ pathname: itemUrl('Plugins/Sales/plugin.json'), state: { rawFile: true } }]}>
+          {wrap(
+            <Routes>
+              <Route path="/workspace/*" element={<LibraryRoutes />} />
+            </Routes>,
+            null,
+          )}
+          <LocationProbe />
+        </MemoryRouter>,
+      );
+      await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+      expect(screen.getByLabelText('pathname')).toHaveTextContent(itemUrl('Plugins/Sales/plugin.json'));
+      expect(await screen.findByRole('link', { name: 'Open plugin' })).toBeInTheDocument();
+    });
+  });
+
+  it("a personal space's access.md opens the same way — it has no listed plugin page at all", async () => {
+    renderAt(itemUrl('Plugins/personal-u1/access.md'));
+    await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+    expect(screen.getByLabelText('pathname')).toHaveTextContent(itemUrl('Plugins/personal-u1/access.md'));
+  });
+
+  /**
+   * A plugin may carry CATEGORY folders: `skills.service` walks until it finds
+   * a `SKILL.md` and treats that folder as the skill, so `Plugins/Engineering/
+   * coding/create-ticket/SKILL.md` is a skill named `create-ticket`.
+   *
+   * Reading the first segment below the plugin asked for the category —
+   * "coding", which no skill answers to — so every nested skill listed
+   * perfectly and then reported "doesn't exist, or you don't have access to
+   * it" on click. Every fixture here used to be flat, which is exactly why
+   * that shipped.
+   */
+  describe('a skill nested under a category folder', () => {
+    const NESTED: LibraryData = {
+      ...CATALOG,
+      skills: [
+        { name: 'create-ticket', description: '', path: 'Plugins/Engineering/coding/create-ticket' },
+        {
+          name: 'architecture-review',
+          description: '',
+          path: 'Plugins/Engineering/review/architecture-review',
+        },
+      ],
+    };
+
+    beforeEach(() => {
+      dataMock.useLibraryData.mockReturnValue(NESTED);
+    });
+
+    it('resolves its SKILL.md to the folder holding it, not the category', async () => {
+      renderAt(itemUrl('Plugins/Engineering/coding/create-ticket/SKILL.md'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+        'create-ticket::SKILL.md',
+      );
+    });
+
+    it('resolves a bundled file below a category folder', async () => {
+      renderAt(itemUrl('Plugins/Engineering/review/architecture-review/check-vocab.mjs'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+        'architecture-review::check-vocab.mjs',
+      );
+    });
+
+    it('resolves a bare nested skill folder to SKILL.md', async () => {
+      renderAt(itemUrl('Plugins/Engineering/coding/create-ticket'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+        'create-ticket::SKILL.md',
+      );
+    });
+
+    it('resolves a nested SKILL.md with no catalog at all', async () => {
+      // The SKILL.md rule reads the URL alone, so the just-created case above
+      // keeps working at depth: the folder holding SKILL.md IS the skill.
+      dataMock.useLibraryData.mockReturnValue({ ...CATALOG, loading: true, skills: [], tools: [] });
+      renderAt(itemUrl('Plugins/Engineering/coding/brand-new-skill/SKILL.md'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+        'brand-new-skill::SKILL.md',
+      );
+    });
+
+    it('resolves a `.tool` filed under a category folder, by its catalog slug', async () => {
+      // `walkFiles` finds manuals at ANY depth, so this is a real listed tool;
+      // matching only the plugin's top level listed it and 404'd the click. The
+      // slug is the manual's declared `id`, which need not match the filename —
+      // so a fixture whose slug equals its filename would prove nothing.
+      dataMock.useLibraryData.mockReturnValue({
+        ...NESTED,
+        tools: [
+          {
+            slug: 'internal_deploy',
+            name: 'internal_deploy',
+            path: 'Plugins/Engineering/coding/deploy.tool',
+            type: 'mcp' as const,
+            setup: null,
+            canWrite: false,
+            variables: [],
+          },
+        ],
+      });
+      renderAt(itemUrl('Plugins/Engineering/coding/deploy.tool'));
+      expect(await screen.findByLabelText('tool-page')).toHaveTextContent('internal_deploy');
+    });
+
+    it("opens a category folder's own access.md as a plain file", async () => {
+      // The same answer a stray file at the plugin's top level gets. Before, it
+      // fell through to a SkillPage named after the category.
+      renderAt(itemUrl('Plugins/Engineering/coding/access.md'));
+      await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+      expect(screen.getByLabelText('pathname')).toHaveTextContent(itemUrl('Plugins/Engineering/coding/access.md'));
+      expect(screen.queryByLabelText('skill-page')).not.toBeInTheDocument();
+    });
+
+    it('waits for the catalog rather than guessing a category is the skill', async () => {
+      // A bare nested folder is ambiguous without the catalog. Guessing sent
+      // SkillPage after a skill named "coding" and flashed a not-found error;
+      // the catalog is what settles it, so hold the slot until it lands.
+      dataMock.useLibraryData.mockReturnValue({ ...NESTED, loading: true, skills: [], tools: [] });
+      renderAt(itemUrl('Plugins/Engineering/coding/create-ticket'));
+      expect(await screen.findByRole('button', { name: /^Everything/ })).toBeInTheDocument();
+      expect(screen.queryByLabelText('skill-page')).toBeNull();
+    });
+
+    it('sends a bare CATEGORY folder to its plugin, not to a skill page', async () => {
+      // A category is not a skill, and `coding` names none. What tells it apart
+      // from a just-created skill the catalog hasn't caught up with is that the
+      // catalog knows skills UNDER it.
+      renderAt(itemUrl('Plugins/Engineering/coding'));
+      await waitFor(() =>
+        expect(screen.getByLabelText('pathname')).toHaveTextContent(
+          '/skills-and-tools/plugins/Engineering',
+        ),
+      );
+      expect(screen.queryByLabelText('skill-page')).toBeNull();
+    });
+
+    it('still opens a folder the catalog has no skills under — a stale new skill', async () => {
+      renderAt(itemUrl('Plugins/Engineering/coding/brand-new-skill'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+        'brand-new-skill::SKILL.md',
+      );
+    });
+
+    it('opens a bundled file of a skill the catalog has not caught up with', async () => {
+      // STALE, not failed: the catalog loaded fine, it just predates the skill.
+      // Concluding "nothing owns this file, so it is not a page" bounced the
+      // reader to the plugin — the very symptom this change exists to remove,
+      // reached through a different unsettled state. Absence proves nothing;
+      // only positive evidence (a known category above it) redirects.
+      renderAt(itemUrl('Plugins/Engineering/coding/brand-new-skill/notes.md'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+        'brand-new-skill::notes.md',
+      );
+    });
+
+    it('still routes a known category by its CACHED skills after a failed refresh', async () => {
+      // `useLibraryData` keeps the previous entries when a refresh fails, and
+      // what the catalog KNOWS stays true — a category is still a category.
+      dataMock.useLibraryData.mockReturnValue({
+        ...NESTED,
+        error: "Couldn't refresh the catalog.",
+      });
+      renderAt(itemUrl('Plugins/Engineering/coding'));
+      await waitFor(() =>
+        expect(screen.getByLabelText('pathname')).toHaveTextContent(
+          '/skills-and-tools/plugins/Engineering',
+        ),
+      );
+    });
+
+    it('does not let a prefix-sharing sibling claim a bundled file', async () => {
+      // Ownership compares whole segments: `create-ticket-v2` shares a string
+      // prefix with `create-ticket` and must not swallow its files.
+      dataMock.useLibraryData.mockReturnValue({
+        ...NESTED,
+        skills: [
+          ...NESTED.skills,
+          {
+            name: 'create-ticket-v2',
+            description: '',
+            path: 'Plugins/Engineering/coding/create-ticket-v2',
+          },
+        ],
+      });
+      renderAt(itemUrl('Plugins/Engineering/coding/create-ticket-v2/notes.md'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+        'create-ticket-v2::notes.md',
+      );
+    });
+  });
+
+  /**
+   * MCP servers declared in a plugin's `mcp.json` — one FILE, several tools, so
+   * the file URL alone cannot name a page: `?server=<slug>` disambiguates (a
+   * query param, never the hash — the `#…` fragment is the OAuth callback's
+   * outcome channel). Before the branch existed, `mcp.json` fell through to the
+   * direct-file rule and every mcp-declared tool card bounced to its plugin.
+   */
+  describe('a server declared in a plugin mcp.json', () => {
+    const mcpTool = (slug: string, path: string) => ({
+      slug,
+      name: slug,
+      path,
+      type: 'mcp' as const,
+      setup: null,
+      canWrite: false,
+      variables: [],
+    });
+    const MCP: LibraryData = {
+      ...CATALOG,
+      tools: [
+        // Two servers sharing one declaring file — the ambiguous case.
+        mcpTool('granola', 'Plugins/Everyone/mcp.json'),
+        mcpTool('linear', 'Plugins/Everyone/mcp.json'),
+        // A file declaring exactly one server — resolvable without the param.
+        mcpTool('local_toolbox', 'Plugins/LocalLab/mcp.json'),
+      ],
+    };
+
+    beforeEach(() => {
+      dataMock.useLibraryData.mockReturnValue(MCP);
+    });
+
+    it('renders the tool page the `?server=` param names', async () => {
+      renderAt(`${itemUrl('Plugins/Everyone/mcp.json')}?server=granola`);
+      expect(await screen.findByLabelText('tool-page')).toHaveTextContent('granola');
+    });
+
+    it('renders the named tool page before the catalog has loaded — the param needs no catalog', async () => {
+      dataMock.useLibraryData.mockReturnValue({ ...CATALOG, loading: true, skills: [], tools: [] });
+      renderAt(`${itemUrl('Plugins/Everyone/mcp.json')}?server=granola`);
+      expect(await screen.findByLabelText('tool-page')).toHaveTextContent('granola');
+    });
+
+    it('resolves a bare mcp.json URL when the catalog knows exactly one server for it', async () => {
+      renderAt(itemUrl('Plugins/LocalLab/mcp.json'));
+      expect(await screen.findByLabelText('tool-page')).toHaveTextContent('local_toolbox');
+    });
+
+    it('sends a bare mcp.json URL with SEVERAL servers to the plugin page — ambiguous, no page', async () => {
+      renderAt(itemUrl('Plugins/Everyone/mcp.json'));
+      await waitFor(() =>
+        expect(screen.getByLabelText('pathname')).toHaveTextContent(
+          '/skills-and-tools/plugins/Everyone',
+        ),
+      );
+      expect(screen.queryByLabelText('tool-page')).toBeNull();
+    });
+
+    it('waits for the catalog on a bare mcp.json URL rather than guessing', async () => {
+      dataMock.useLibraryData.mockReturnValue({ ...CATALOG, loading: true, skills: [], tools: [] });
+      renderAt(itemUrl('Plugins/LocalLab/mcp.json'));
+      expect(await screen.findByRole('button', { name: /^Everything/ })).toBeInTheDocument();
+      expect(screen.queryByLabelText('tool-page')).toBeNull();
+      // …and it has not been bounced away either: the URL is still the file's.
+      expect(screen.getByLabelText('pathname')).toHaveTextContent('/Plugins/LocalLab/mcp.json');
+    });
+
+    /**
+     * Only the plugin's DIRECT child is the declaring file — the backend reads
+     * exactly `Plugins/<plugin>/mcp.json`. An `mcp.json` bundled INSIDE a
+     * skill (an example, a template) is that skill's file, and rendering it as
+     * a tool page would 404 a perfectly real skill asset.
+     */
+    it("keeps a skill-bundled mcp.json as that skill's file, not a tool page", async () => {
+      renderAt(itemUrl('Plugins/Sales/create-sales-deck/mcp.json'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+        'create-sales-deck::mcp.json',
+      );
+      expect(screen.queryByLabelText('tool-page')).toBeNull();
+    });
+
+    it('a `?server=` param cannot turn a nested mcp.json into a tool page either', async () => {
+      renderAt(`${itemUrl('Plugins/Sales/create-sales-deck/examples/mcp.json')}?server=granola`);
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+        'create-sales-deck::examples/mcp.json',
+      );
+      expect(screen.queryByLabelText('tool-page')).toBeNull();
+    });
+  });
+
+  /**
+   * A skill's id is its frontmatter `id`/`name`, and only FALLS BACK to the
+   * folder name — so the URL cannot be trusted to spell it. The catalog can.
+   */
+  it('resolves a skill whose declared id differs from its folder name', async () => {
+    dataMock.useLibraryData.mockReturnValue({
+      ...CATALOG,
+      skills: [{ name: 'deck-builder', description: '', path: 'Plugins/Sales/create-sales-deck' }],
+    });
+    renderAt(itemUrl('Plugins/Sales/create-sales-deck/SKILL.md'));
+    expect(await screen.findByLabelText('skill-page')).toHaveTextContent('deck-builder::SKILL.md');
+  });
+
+  it("keeps a SKILL.md bundled INSIDE a skill as that skill's file", async () => {
+    // `skills.service` stops at the first `SKILL.md` and treats that folder as
+    // the skill, so a nested one is a bundled asset — never a skill called
+    // `examples`.
+    renderAt(itemUrl('Plugins/Sales/create-sales-deck/examples/SKILL.md'));
+    expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+      'create-sales-deck::examples/SKILL.md',
+    );
+  });
+
+  /**
+   * A failed catalog is "we couldn't ask", not "no such item" — the same
+   * distinction PluginPage draws. Reading it as proof that nothing owns the
+   * file would bounce every bundled-file deep link to the plugin page during a
+   * transient outage, losing the URL; the skill detail comes from a different
+   * endpoint and can still answer.
+   */
+  it('keeps a bundled-file deep link on the skill page when the catalog failed', async () => {
+    dataMock.useLibraryData.mockReturnValue({
+      ...CATALOG,
+      loading: false,
+      error: "Couldn't load the catalog.",
+      skills: [],
+      tools: [],
+    });
+    // The file's own folder is the best available reading without a catalog
+    // (an asset nested deeper simply cannot be attributed) — the point is that
+    // the reader stays on a skill page instead of being bounced to the plugin.
+    renderAt(itemUrl('Plugins/Sales/create-sales-deck/notes.md'));
+    expect(await screen.findByLabelText('skill-page')).toHaveTextContent(
+      'create-sales-deck::notes.md',
+    );
+  });
+
+  /**
+   * The shared-skills root: skills and the scope folders that own them, no
+   * plugin around them. The same evidence rules as under `Plugins/`, with
+   * the two plugin destinations replaced — a scope has no page, and a file
+   * filed directly in a scope opens as the plain file it is.
+   */
+  describe('a skill under the shared Skills/ root', () => {
+    const SHARED: LibraryData = {
+      ...CATALOG,
+      skills: [
+        ...CATALOG.skills,
+        { name: 'discovery-call', description: '', path: 'Skills/Sales/discovery-call' },
+      ],
+    };
+
+    beforeEach(() => {
+      dataMock.useLibraryData.mockReturnValue(SHARED);
+    });
+
+    it("renders a shared skill file on that file's tab, inside the library nav", async () => {
+      renderAt(itemUrl('Skills/Sales/discovery-call/checklist.md'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent('discovery-call::checklist.md');
+      expect(screen.getByRole('button', { name: /^Everything/ })).toBeInTheDocument();
+    });
+
+    it('opens a bare shared skill folder on SKILL.md', async () => {
+      renderAt(itemUrl('Skills/Sales/discovery-call'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent('discovery-call::SKILL.md');
+    });
+
+    it('resolves a just-created shared skill from its SKILL.md alone', async () => {
+      dataMock.useLibraryData.mockReturnValue({ ...CATALOG, loading: true, skills: [], tools: [] });
+      renderAt(itemUrl('Skills/Sales/brand-new/SKILL.md'));
+      expect(await screen.findByLabelText('skill-page')).toHaveTextContent('brand-new::SKILL.md');
+    });
+
+    it('sends a SCOPE folder home — the sidebar tree is where scopes are browsed', async () => {
+      renderAt(itemUrl('Skills/Sales'));
+      await waitFor(() =>
+        expect(screen.getByLabelText('pathname')).toHaveTextContent(/^\/skills-and-tools$/),
+      );
+    });
+
+    it("opens a scope's own file as a plain file, inside the library frame", async () => {
+      renderAt(itemUrl('Skills/Sales/access.md'));
+      await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+      // Same URL — the file route renders in place, no navigation.
+      expect(screen.getByLabelText('pathname')).toHaveTextContent(itemUrl('Skills/Sales/access.md'));
+      expect(screen.getByRole('button', { name: /^Everything/ })).toBeInTheDocument();
+      expect(screen.queryByLabelText('skill-page')).not.toBeInTheDocument();
+    });
+
+    it("carries a scope file's #fragment into the raw view — a heading deep link still lands", async () => {
+      renderAt(`${itemUrl('Skills/Sales/README.md')}#goal`);
+      await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+      expect(screen.getByLabelText('hash')).toHaveTextContent('#goal');
+    });
+
+    it("opens a scope's loose file as a plain file when the TREE shows no SKILL.md there — before the catalog answers", async () => {
+      // A scope with nothing the caller may read beneath it: the catalog has
+      // no evidence, but the workspace tree has the folder and no SKILL.md in
+      // it, and a folder without one is no skill.
+      dataMock.useLibraryData.mockReturnValue({ ...CATALOG, loading: true, skills: [], tools: [] });
+      const d = (rel: string, children: FileTreeEntry[]): FileTreeEntry => ({
+        name: rel.split('/').pop() ?? rel,
+        relativePath: rel,
+        type: 'directory',
+        children,
+      });
+      const tree = d('.', [
+        d(KB, [d(`${KB}/Skills`, [d(`${KB}/Skills/Sales`, [{ name: 'notes.md', relativePath: `${KB}/Skills/Sales/notes.md`, type: 'file' }])])]),
+      ]);
+      renderAt(itemUrl('Skills/Sales/notes.md'), tree);
+      await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+      expect(screen.queryByLabelText('skill-page')).not.toBeInTheDocument();
+    });
+
+    it("does not read a SKILL.md URL into a folder the tree shows has none as a skill", async () => {
+      dataMock.useLibraryData.mockReturnValue({ ...CATALOG, loading: true, skills: [], tools: [] });
+      const d = (rel: string, children: FileTreeEntry[]): FileTreeEntry => ({
+        name: rel.split('/').pop() ?? rel,
+        relativePath: rel,
+        type: 'directory',
+        children,
+      });
+      const tree = d('.', [
+        d(KB, [d(`${KB}/Skills`, [d(`${KB}/Skills/Sales`, [{ name: 'notes.md', relativePath: `${KB}/Skills/Sales/notes.md`, type: 'file' }])])]),
+      ]);
+      renderAt(itemUrl('Skills/Sales/SKILL.md'), tree);
+      await waitFor(() => expect(screen.getByLabelText('file-view')).toBeInTheDocument());
+      expect(screen.queryByLabelText('skill-page')).not.toBeInTheDocument();
+    });
+
+    it('waits for the catalog rather than guessing a scope is a skill', async () => {
+      dataMock.useLibraryData.mockReturnValue({ ...CATALOG, loading: true, skills: [], tools: [] });
+      renderAt(itemUrl('Skills/Sales'));
+      await waitFor(() => expect(screen.getByRole('button', { name: /^Everything/ })).toBeInTheDocument());
+      expect(screen.queryByLabelText('skill-page')).not.toBeInTheDocument();
+      expect(screen.getByLabelText('pathname')).toHaveTextContent(itemUrl('Skills/Sales'));
+    });
+  });
+
+  it('a non-default branch never renders an item page', async () => {
+    renderAt(itemUrl('Plugins/Sales/create-sales-deck/SKILL.md', 'razvan/some-draft'));
+    await waitFor(() =>
+      expect(screen.getByLabelText('pathname')).toHaveTextContent(/^\/skills-and-tools$/),
+    );
+  });
+});
+
+describe('isLibraryLocation — the surface rule', () => {
+  it.each([
+    ['/skills-and-tools', true],
+    ['/skills-and-tools/plugins/Sales', true],
+    [itemUrl('Plugins/Sales/create-sales-deck/SKILL.md'), true],
+    [itemUrl('Plugins/Support/notion.tool'), true],
+    // KnowledgeBase paths are the Knowledge app's, whatever the file.
+    [`/workspace/${DEFAULT_BRANCH}/${KB}/KnowledgeBase/Handbook/Tone of voice.md`, false],
+    // Drafts review raw, in Knowledge — the library speaks the default branch.
+    [itemUrl('Plugins/Sales/create-sales-deck/SKILL.md', 'razvan/draft'), false],
+    // Too shallow to name an item (`Plugins/` itself, a plugin folder alone).
+    [`/workspace/${DEFAULT_BRANCH}/${KB}/Plugins`, false],
+    [`/workspace/${DEFAULT_BRANCH}/${KB}/Plugins/Sales`, false],
+    ['/workspace', false],
+    ['/secrets', false],
+  ])('%s → %s', (pathname, expected) => {
+    expect(isLibraryLocation(pathname)).toBe(expected);
+  });
+});

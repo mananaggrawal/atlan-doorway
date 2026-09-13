@@ -1,0 +1,21 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@3.1.1/schema.json",
+  "changelog": false,
+  "commit": false,
+  "access": "public",
+  "baseBranch": "main",
+  "fixed": [
+    [
+      "@atlan-doorway/platform-shared",
+      "@atlan-doorway/platform-mcp-core",
+      "@atlan-doorway/doorway-mcp",
+      "@atlan-doorway/platform-core-backend",
+      "@atlan-doorway/platform-core-frontend"
+    ]
+  ],
+  "updateInternalDependencies": "patch",
+  "ignore": [
+    "@atlan-doorway/server",
+    "@atlan-doorway/web"
+  ]
+}

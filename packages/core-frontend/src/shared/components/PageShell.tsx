@@ -1,0 +1,59 @@
+import type { ReactNode } from 'react';
+
+const WIDTH_CLASS = {
+  '3xl': 'max-w-3xl',
+  '4xl': 'max-w-4xl',
+} as const;
+
+export type PageShellWidth = keyof typeof WIDTH_CLASS;
+
+/**
+ * Minimal shared chrome for the shell's standalone routed pages (Secrets,
+ * External agent access, App roles): a full-height scrolling canvas
+ * with a centered max-width column, a page-title row and a white content
+ * card. Deliberately tiny — it mirrors the Tailwind idioms the tools
+ * explorer page already uses; it is not a design system.
+ *
+ * `padded` drops the card's default padding for pages that own their inner
+ * layout (e.g. a tab strip flush against the card's top edge).
+ * `card={false}` leaves surface ownership to pages with multiple peer cards.
+ */
+export function PageShell({
+  title,
+  actions,
+  width = '3xl',
+  padded = true,
+  card = true,
+  children,
+}: {
+  title: string;
+  /** Rendered right-aligned in the title row (e.g. a refresh button). */
+  actions?: ReactNode;
+  width?: PageShellWidth;
+  padded?: boolean;
+  card?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div className="h-full overflow-y-auto bg-sunken">
+      <div className={`${WIDTH_CLASS[width]} mx-auto px-4 sm:px-6 py-8`}>
+        {/* `flex-wrap` so a wide `actions` control (e.g. the New role form, once
+            expanded) drops below the title on a narrow viewport instead of
+            overflowing the column. */}
+        <header className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <h1 className="text-lg font-semibold text-ink">{title}</h1>
+          {actions && <div className="flex items-center gap-2">{actions}</div>}
+        </header>
+        {card ? (
+          <section
+            className={`bg-white border border-line rounded-lg ${
+              padded ? 'p-4' : 'overflow-hidden'
+            }`}
+          >
+            {children}
+          </section>
+        ) : children}
+      </div>
+    </div>
+  );
+}

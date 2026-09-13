@@ -1,0 +1,655 @@
+name: KB Architecture Review
+
+# The PR author triggers the review by commenting `/doorway-review` on the PR,
+# by convention after CodeRabbit has finished its code-level pass. The agent
+# loads the architecture-review skill + this repo's rules from the knowledge
+# base, reviews the diff, and routes the outcome per the project's Review
+# Policy — go-ahead / bounce to author / escalate — as PR comments.
+#
+# Setup (once per repo):
+#   - repo variable  KNOWLEDGE_BASE_API_URL  — e.g. https://<company>.atlan-doorway.example.com
+#   - repo secret    KNOWLEDGE_BASE_CONNECTION_KEY — from the KB settings page
+#
+# The agent's INSTRUCTIONS live in the knowledge base, not here: this file
+# passes the skill's path plus the run's context (repo, PR number, KB origin,
+# verdict path) and nothing else. Reviewing behaviour is then versioned and
+# reviewed like every other rule, and the two repositories that run this
+# workflow cannot drift apart.
+#
+# Split into three jobs on purpose. Actions permissions are per-JOB, not per-
+# step, so anything the agent's job can do, a prompt injection riding in on the
+# PR can do too. The agent reads attacker-controllable text by design — the
+# diff, the description, every comment on the thread — so the token it sits
+# next to must not be able to publish the PR's own check, nor speak on the PR.
+# `start` opens the check, `review` runs the agent with NO write access to this
+# repository at all, and `publish` turns the verdict the agent recorded into
+# the PR comment and the commit status.
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate the command and open the check. Nothing attacker-controlled is read
+  # here beyond the comment body prefix, and no secret is in scope.
+  # ---------------------------------------------------------------------------
+  start:
+    # This repo is public and `issue_comment` is NOT covered by the fork-PR
+    # approval policy: the run starts immediately, on the default branch, with
+    # the KB connection key and a write-scoped token in scope. Without a gate
+    # any GitHub account could comment `/doorway-review` on any PR and drive the
+    # agent. First filter: association, so a drive-by comment never spins up a
+    # runner. It is deliberately broader than "write access" — MEMBER is every
+    # org member (org base permission here is `read`) and COLLABORATOR is any
+    # invitation at any level — so the job re-checks for real below.
+    if: >-
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, '/doorway-review') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # Both, because the 👀 lands on a comment that sits on a PULL REQUEST:
+      # the endpoint is the issues one, but GITHUB_TOKEN gates a PR's comments
+      # and reactions behind `pull-requests`, not `issues`. Grant only the
+      # second and the reaction is refused with a 403.
+      pull-requests: write
+      issues: write
+      statuses: write   # open the pending check
+    outputs:
+      ref: ${{ steps.pr.outputs.ref }}
+      sha: ${{ steps.pr.outputs.sha }}
+
+    steps:
+      # Second filter, and the authoritative one: narrow the association gate
+      # down to actual write access on THIS repo. Runs before anything else, so
+      # an unauthorized comment costs one API call and stops.
+      #
+      # The permission endpoint wants push access itself; if the job token is
+      # ever scoped too thinly for it, fall back to the association the `if:`
+      # already validated rather than bricking the command — that fallback is
+      # exactly the old behaviour, never weaker.
+      - name: Authorize commenter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          ASSOCIATION: ${{ github.event.comment.author_association }}
+        run: |
+          set -uo pipefail
+
+          if ! perm=$(gh api "repos/${{ github.repository }}/collaborators/$ACTOR/permission" \
+                        --jq .permission 2>/dev/null); then
+            echo "::warning::Could not read $ACTOR's repo permission — falling back to author_association=$ASSOCIATION."
+            exit 0
+          fi
+
+          case "$perm" in
+            admin|maintain|write)
+              echo "$ACTOR authorized (permission=$perm)." ;;
+            *)
+              echo "::error::$ACTOR has permission '$perm' on this repository — /doorway-review needs write access."
+              exit 1 ;;
+          esac
+
+      # Instant sign of life: react 👀 to the triggering comment so the author
+      # knows the command was seen while the agent (~3 min) spins up.
+      #
+      # It is cosmetic, so it must never be able to gate the review. It once
+      # ran with `issues: write` but not `pull-requests: write`, which is the
+      # scope that actually governs a PR's comments (see the job permissions
+      # above); the resulting 403 under `bash -e` took down `start` before it
+      # could open the check; `publish` is gated on
+      # `needs.start.result == 'success'`, so the whole review died and the PR
+      # kept whatever stale status it already had. The scope is granted now,
+      # but keep swallowing any failure into a warning: losing the 👀 is a
+      # papercut, losing the review is not.
+      - name: Acknowledge the command
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST \
+            "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes \
+            || echo "::warning::Could not react to the triggering comment — continuing with the review."
+
+      - name: Resolve PR head branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "ref=$(gh pr view ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --json headRefName -q .headRefName)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(gh pr view ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --json headRefOid -q .headRefOid)" >> "$GITHUB_OUTPUT"
+
+      # issue_comment runs attach to the default branch, not the PR, so the run
+      # itself never shows in the PR's checks. Publish a commit STATUS on the PR
+      # head instead: pending now; the `publish` job sets the final state to
+      # match the agent's routing verdict. Make `doorway/architecture-review` a
+      # required check in branch protection to enforce the review policy
+      # mechanically.
+      - name: Mark review status pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.sha }}" \
+            -f state=pending \
+            -f context=doorway/architecture-review \
+            -f description="Architecture review running" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  # ---------------------------------------------------------------------------
+  # Run the agent. This job holds the KB key and can comment on the PR, but it
+  # deliberately has NO `statuses: write` — an injected agent must not be able
+  # to stamp `doorway/architecture-review` green on this or any other commit.
+  # It records its verdict to a file; `publish` is what turns that into a check.
+  # ---------------------------------------------------------------------------
+  review:
+    needs: start
+    runs-on: ubuntu-latest
+    # Sized for a full sweep, not a skim: the review skill obliges the agent
+    # to enumerate every added symbol and trace guards/locks/contracts to
+    # their other end in the local checkout. Thoroughness is the product;
+    # a shorter cap here quietly rewards sampling.
+    timeout-minutes: 45
+    permissions:
+      # READ-ONLY, deliberately. The agent needs to see the PR (description,
+      # threads, checks) to review it, and nothing more: `publish` speaks for
+      # it. Anything writable here is writable by a prompt injection too.
+      contents: read
+      pull-requests: read
+      issues: read
+      # The agent's Review Policy will not hand out a go-ahead without green
+      # CI, and CI here is a CHECK RUN, not a commit status — two different
+      # APIs behind two different scopes. `checks: read` covers the first.
+      checks: read
+      # And `actions: read` beside it, because the agent asks BOTH questions:
+      # the check runs on a commit, and the workflow runs behind them. Granting
+      # only the first still left it reporting 403 on "Actions workflow runs"
+      # and caveating a go-ahead for evidence it could only half see.
+      actions: read
+    outputs:
+      verdict_b64: ${{ steps.verdict.outputs.verdict_b64 }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.start.outputs.ref }}
+          # Full history so the agent can diff against the PR base branch.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The prompt is a POINTER, not a policy. Everything about how to behave —
+      # untrusted-input handling, what to read, what to deliver — lives in the
+      # skill named below and is versioned in the knowledge base. Keep this
+      # block to the run's own facts: they are the only things the KB cannot
+      # know. The verdict path is written out in full rather than as
+      # `$VERDICT_FILE`, so the agent never has to depend on a shell expanding
+      # it correctly.
+      - name: Run architecture review
+        run: npx --yes @atlan-doorway/pipeline-agent@latest
+        env:
+          KNOWLEDGE_BASE_API_URL: ${{ vars.KNOWLEDGE_BASE_API_URL }}
+          KNOWLEDGE_BASE_CONNECTION_KEY: ${{ secrets.KNOWLEDGE_BASE_CONNECTION_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          AGENT_PROMPT: |
+            Read the skill `Plugins/Engineering/review/pr-review-pipeline/SKILL.md`
+            from the knowledge base and follow it exactly. It is the contract for
+            this run: how to treat what you read, what to review, and what to
+            deliver. Read it before anything else, and before reading any part of
+            the pull request.
+
+            To reach it: call the KnowledgeBase `start_session` tool once, then
+            pass the returned id as `sessionId` on every later KnowledgeBase call.
+            `list_files` the workspace root once to learn the repo folder's name
+            and prefix the skill path with it.
+
+            Run context:
+            - Repository: ${{ github.repository }}
+            - Pull request: #${{ github.event.issue.number }}
+            - Knowledge base origin: ${{ vars.KNOWLEDGE_BASE_API_URL }}
+            - Review run id (stamp it into the one-pager's `doorway-review-run` meta tag): ${{ github.run_id }}
+            - Verdict file (write your verdict JSON here): ${{ runner.temp }}/doorway-verdict.json
+
+      # Hand the verdict to `publish` as one base64 line. `always()` so a
+      # crashed or silently-declining agent still yields an (empty) verdict for
+      # `publish` to turn into an errored check rather than one stuck pending.
+      #
+      # Base64 because the payload is multi-line JSON and job outputs are
+      # single-line strings — encoding it is what keeps a newline inside a
+      # finding from ending the output and injecting workflow commands. It is
+      # transport, NOT sanitisation: `publish` still validates every field.
+      - name: Collect the verdict
+        id: verdict
+        if: always()
+        env:
+          VERDICT_FILE: ${{ runner.temp }}/doorway-verdict.json
+        run: |
+          set -uo pipefail
+
+          if [ ! -s "$VERDICT_FILE" ]; then
+            echo "Agent recorded no verdict at $VERDICT_FILE."
+            exit 0
+          fi
+
+          if ! jq -e . "$VERDICT_FILE" >/dev/null 2>&1; then
+            echo "::warning::Verdict file is not valid JSON — treating as no verdict."
+            cat "$VERDICT_FILE"
+            exit 0
+          fi
+
+          # The handoff is bounded twice over: a job output at ~1 MB, and —
+          # tighter — `publish` reads this value as an environment variable,
+          # which Linux caps at 128 KiB per string. A verdict past either makes
+          # the handoff fail and strands the run. Cap it well under the tighter
+          # bound and let `publish` report the ordinary no-verdict status
+          # instead.
+          verdict_b64=$(jq -c . "$VERDICT_FILE" | base64 -w0)
+          if [ "${#verdict_b64}" -gt 100000 ]; then
+            echo "::warning::Verdict is ${#verdict_b64} encoded bytes — too large to publish; treating as no verdict."
+            cat "$VERDICT_FILE"
+            exit 0
+          fi
+          echo "verdict_b64=$verdict_b64" >> "$GITHUB_OUTPUT"
+          cat "$VERDICT_FILE"
+
+  # ---------------------------------------------------------------------------
+  # The only job that speaks on the PR. It reads the agent's verdict and renders
+  # it; it never reads the PR itself. Splitting it out is what lets the review
+  # job run with no write access at all: an injected agent can propose a comment
+  # body, but only through the four validated fields below, and it can never
+  # stamp its own check.
+  #
+  # Runs on every outcome so the check is never left stuck on "pending —
+  # running": the agent can fail to reach a verdict without failing its step (it
+  # exits 0 having declined to act), and `failure()` does not fire for that.
+  #
+  # It holds the knowledge-base key, for one read: checking that the one-pager
+  # the agent links to is really there AND was written by this run rather than
+  # left over from an earlier one. That is safe here precisely because this job
+  # reads nothing the PR's author wrote — only the four fields below, and the
+  # head of a page the agent wrote into the knowledge base.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [start, review]
+    if: always() && needs.start.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+      # The review comment goes through the issues endpoint (a PR is an issue
+      # there), but GITHUB_TOKEN authorises a comment on a PULL REQUEST under
+      # `pull-requests`, not `issues`: with only the latter the POST is refused
+      # with `Resource not accessible by integration` (403), the comment is
+      # lost, and the job fails while the status still publishes. Keep both.
+      pull-requests: write
+      issues: write
+
+    steps:
+      # Everything in the verdict came through an agent that reads attacker-
+      # controllable text, so treat all four fields as hostile: allowlist the
+      # outcome, cap and de-newline the prose, cap the finding count, and
+      # require the link to point at the knowledge base or this repository —
+      # and, for a knowledge-base link, to name a file that actually exists.
+      # jq does the parsing — the payload never reaches the shell as code.
+      - name: Render the verdict
+        id: render
+        env:
+          VERDICT_B64: ${{ needs.review.outputs.verdict_b64 }}
+          KB_ORIGIN: ${{ vars.KNOWLEDGE_BASE_API_URL }}
+          KB_KEY: ${{ secrets.KNOWLEDGE_BASE_CONNECTION_KEY }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REVIEW_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Every extraction below must degrade to "no verdict" rather than
+          # abort the job: this step runs under `set -e`, and a malformed
+          # payload that killed it would leave the PR's check stuck on pending
+          # forever — the exact failure this job exists to prevent. So decode
+          # and shape-check first, then give every jq program a total answer
+          # (`tostring`, array coercion) for inputs of the wrong type.
+          outcome=none
+          headline=""
+          headline_md=""
+          url=""
+          : > findings.md
+
+          if [ -z "${VERDICT_B64:-}" ]; then
+            echo "No verdict recorded by the agent."
+          elif ! printf '%s' "$VERDICT_B64" | base64 -d > verdict.json 2>/dev/null; then
+            echo "::warning::Verdict payload did not decode — treating as no verdict."
+          elif ! jq -s -e 'length == 1 and (.[0] | type == "object")' verdict.json >/dev/null 2>&1; then
+            # `-s` (slurp) is what makes this ONE document: jq streams a file
+            # holding `{…}{…}` as two, every later filter then prints one line
+            # PER document, and `outcome=$(…)` would carry a newline straight
+            # into $GITHUB_OUTPUT — a second line the agent chose. Exactly one
+            # top-level object, or there is no verdict.
+            echo "::warning::Verdict is not exactly one JSON object — treating as no verdict."
+          else
+            outcome=$(jq -r '(.outcome? // "") | tostring | ascii_downcase | gsub("[^a-z-]"; "")' verdict.json)
+            case "$outcome" in
+              go-ahead|bounce|escalated) ;;
+              *) echo "::warning::Unrecognised outcome from the agent: $outcome"; outcome=none ;;
+            esac
+
+            headline=$(jq -r '(.headline? // "") | tostring | gsub("[[:space:]]+"; " ") | .[0:120]' verdict.json)
+
+            # Backslash-escape Markdown metacharacters (and the colon, which
+            # defuses bare-URL autolinks) in every piece of agent prose that
+            # lands in the comment: it must render as inert text, never as a
+            # live link or markup the agent chose. The commit status keeps the
+            # raw headline — its description is plain text, not Markdown.
+            headline_md=$(printf '%s' "$headline" \
+              | jq -Rr 'gsub("(?<m>[\\\\`*_{}\\[\\]()<>#!|~:])"; "\\" + .m)')
+
+            # One markdown bullet per finding, severity forced onto the
+            # allowlist so the agent cannot invent a louder label.
+            jq -r '
+              ((.findings? // []) | if type == "array" then . else [] end)[:8][]
+              | select(type == "object")
+              | ((.severity? // "") | tostring) as $s
+              | (if $s == "violation" then "violation"
+                 elif $s == "question" then "question"
+                 else "risk" end) as $sev
+              | ((.text? // "") | tostring | gsub("[[:space:]]+"; " ") | .[0:200]
+                 | gsub("(?<m>[\\\\`*_{}\\[\\]()<>#!|~:])"; "\\" + .m)) as $text
+              | select($text != "")
+              | "- **" + $sev + "** — " + $text
+            ' verdict.json > findings.md
+
+            # Keep only unambiguous URL characters: whitespace and anything
+            # that could break out of the Markdown link destination or smuggle
+            # a second link — (), [], <>, quotes, backticks, backslashes — are
+            # dropped BEFORE the origin check below, so the string it approves
+            # is exactly the string that gets posted.
+            url=$(jq -r '(.one_pager_url? // "") | tostring | gsub("[^A-Za-z0-9:/?#@!$&*+,;=._~%-]"; "")' verdict.json)
+          fi
+
+
+          # A status target_url and a comment body are both bounded; a URL past
+          # any sane length is not a link anyone can follow anyway.
+          if [ "${#url}" -gt 2000 ]; then
+            echo "::warning::Discarding over-long one_pager_url from the agent (${#url} chars)"
+            url=""
+          fi
+
+          case "$url" in
+            "${KB_ORIGIN%/}"/*|"$REPO_URL"/*) ;;
+            "") ;;
+            *) echo "::warning::Discarding off-site one_pager_url from the agent: $url"; url="" ;;
+          esac
+
+          # A knowledge-base link is also checked for EXISTENCE. The agent
+          # records `one_pager_url` BEFORE it writes the one-pager, so a run
+          # that stops early publishes a link to a file that was never written
+          # — the PR then carries a dead link, and nothing on the PR says so.
+          # Ask the knowledge base whether the file is there: one session, one
+          # stat. Drop the link only on a definite "not found"; when the check
+          # itself cannot run (no key, KB down, access refused) keep the link
+          # and warn, so a hiccup here never hides a one-pager that exists.
+          onepager_missing=0
+          onepager_stale=0
+          # 0 only when THIS run's page was read back and lacks a non-empty
+          # "Rule outputs" section. Deliberately generic: the workflow checks
+          # that the section EXISTS — which rules it holds, and their shapes,
+          # live in the knowledge base's rule nodes, so rules can be added,
+          # edited or removed without touching this file. Defaults to 1
+          # because every path that cannot read the page either errors via
+          # onepager_ok already or is excused (KB unreachable).
+          ruleoutputs_ok=1
+          # 1 only when the one-pager was read back and names THIS run — or
+          # when the knowledge base could not be asked at all, because an
+          # outage must never fail a review by itself. Everything else — no
+          # link, an off-site or over-long link, a missing file, another
+          # run's page — leaves it 0, and a terminal verdict is then published
+          # as an errored, incomplete review (see the status step).
+          onepager_ok=0
+          case "$url" in
+            "${KB_ORIGIN%/}"/workspace/*)
+              # <origin>/workspace/<branch>/<workspace path>, both URL-encoded.
+              # The %XX → \xXX decode CAN yield characters the charset filter
+              # dropped (`%5C` is a backslash, `%20` a space): the decoded
+              # branch and path are agent-chosen text. They are safe because
+              # of where they go — `jq --arg` and a JSON request body, both of
+              # which escape their input — and never into a command line.
+              rest=${url#"${KB_ORIGIN%/}"/workspace/}
+              rest=${rest%%[?#]*}
+              enc_branch=${rest%%/*}
+              enc_path=${rest#*/}
+              branch=$(printf '%b' "${enc_branch//%/\\x}")
+              path=$(printf '%b' "${enc_path//%/\\x}")
+
+              if [ -z "$enc_branch" ] || [ "$enc_path" = "$rest" ] || [ -z "$path" ]; then
+                echo "::warning::The agent's one_pager_url names no file in the knowledge base — dropping the link: $url"
+                url=""; onepager_missing=1
+              elif ! sid=$(curl -sS -f -m 20 -X POST \
+                        -H "Authorization: Bearer $KB_KEY" -H 'Content-Type: application/json' -d '{}' \
+                        "${KB_ORIGIN%/}/api/agent/tools/start_session" | jq -r '.sessionId // empty') \
+                   || [ -z "$sid" ]; then
+                echo "::warning::Could not open a knowledge-base session to verify the one-pager — keeping the link unverified."
+                onepager_ok=1
+              else
+                # ONE read answers both questions. `read_file` on a missing
+                # path surfaces the filesystem's ENOENT as
+                # `{ "error": "File not found: <path>" }` — served with a 500,
+                # not a 404, so the status code is no help — while an access
+                # refusal or an outage says something else entirely; match
+                # that one message, in the JSON field it lives in, so no other
+                # failure text can pass for an absence. And existence is not
+                # enough: every terminal run must REGENERATE the one-pager at
+                # its fixed per-PR path, so a run that stopped after the
+                # verdict still links to the previous run's page — which may
+                # even review the same head, when a re-trigger applies changed
+                # rules to unchanged code. So the page names the RUN that wrote
+                # it, and only this run's id passes. The read covers the whole
+                # page (the tag is in <head>, but the Rule outputs check below
+                # needs the body; the cap is generous, not unbounded). The
+                # pattern is handed to jq as an argument — POSIX classes, no
+                # backslashes — and tolerates quote style, spacing and a
+                # self-closing `/>`, never a different run id.
+                read_args=$(jq -n --arg b "$branch" --arg p "$path" --arg s "$sid" \
+                  '{branch: $b, path: $p, sessionId: $s, limit: 200000}')
+                code=$(curl -sS -m 20 -o page.json -w '%{http_code}' -X POST \
+                        -H "Authorization: Bearer $KB_KEY" -H 'Content-Type: application/json' \
+                        -d "$read_args" "${KB_ORIGIN%/}/api/agent/tools/read_file" || echo 000)
+                tag_pattern="<meta[[:space:]]+name=[\"']doorway-review-run[\"'][[:space:]]+content=[\"']${REVIEW_RUN_ID}[\"'][[:space:]]*/?>"
+                if [ "$code" = 200 ] && [ -n "${REVIEW_RUN_ID:-}" ] \
+                   && jq -e --arg pat "$tag_pattern" '(.content? // "") | tostring | test($pat; "i")' page.json >/dev/null 2>&1; then
+                  echo "One-pager verified in the knowledge base and written by this run: $branch:$path"
+                  onepager_ok=1
+                  # The page is real and this run's — now the generic format
+                  # gate: a terminal review's page must carry a non-empty
+                  # Rule outputs section (the template's
+                  # `<pre class="rule-outputs">`). A page without one is a
+                  # summary, not a review — the incident here was a "pass"
+                  # whose page narrated the rules in prose and skipped every
+                  # required block. Only substance is checked — WHICH rules
+                  # and their shapes live in the rule nodes.
+                  #
+                  # The question is asked of the section's CONTENT, not of
+                  # the page's shape: capture each rule-outputs block's
+                  # interior (lazy, up to its closing tag) and pass when ANY
+                  # interior holds a non-space character. One semantic, so
+                  # the traps of composing page-level patterns cannot recur:
+                  # content may open with markup, and an empty block beside a
+                  # substantive one is fine. A block with no closing tag
+                  # captures nothing and is treated as absent — that page is
+                  # malformed, and erroring it is correct.
+                  #
+                  # ALL whitespace is collapsed to single spaces BEFORE the
+                  # match, so the pattern never needs a newline-crossing
+                  # mode and carries only the boring `i` flag. That is
+                  # load-bearing: jq's regex flags are Oniguruma, not PCRE —
+                  # `s` is single-line ANCHORS and `m` is the dotall — and a
+                  # PCRE-shaped flag here silently matched nothing across
+                  # lines, erroring a valid review. Verified against jq
+                  # itself, not an approximation of it.
+                  ro_pattern="<pre [^>]*class=[\"']rule-outputs[\"'][^>]*>(.*?)</pre>"
+                  if ! jq -e --arg pat "$ro_pattern" \
+                       '(.content? // "") | tostring | gsub("[[:space:]]+"; " ") | [scan($pat; "i")] | flatten | map(tostring) | any(test("[^ ]"))' \
+                       page.json >/dev/null 2>&1; then
+                    echo "::warning::The one-pager at $branch:$path has no non-empty Rule outputs section — the review's rule blocks are its evidence; marking the check errored."
+                    ruleoutputs_ok=0
+                  fi
+                elif [ "$code" = 200 ]; then
+                  echo "::warning::The one-pager at $branch:$path was not written by this run ($REVIEW_RUN_ID) — a previous run's page; dropping the link."
+                  url=""; onepager_stale=1
+                elif jq -e '(.error? // "") | tostring | startswith("File not found: ")' page.json >/dev/null 2>&1; then
+                  echo "::warning::The agent's one_pager_url names a file the knowledge base does not have ($branch:$path) — dropping the link."
+                  url=""; onepager_missing=1
+                else
+                  echo "::warning::Could not verify the one-pager (HTTP $code) — keeping the link unverified."
+                  cat page.json 2>/dev/null || true
+                  onepager_ok=1
+                fi
+              fi
+              ;;
+          esac
+
+          {
+            echo "outcome=$outcome"
+            echo "headline=$headline"
+            echo "url=$url"
+            echo "onepager_ok=$onepager_ok"
+            echo "ruleoutputs_ok=$ruleoutputs_ok"
+          } >> "$GITHUB_OUTPUT"
+
+          # The comment body: verdict line, the risks and blockers, the link.
+          # Nothing else — depth lives in the one-pager, which is behind the
+          # knowledge base's access model rather than on a public PR.
+          case "$outcome" in
+            go-ahead)  title="Architecture review: **go-ahead**" ;;
+            bounce)    title="Architecture review: **changes requested**" ;;
+            escalated) title="Architecture review: **escalated to a tech lead**" ;;
+            *)         title="Architecture review: **did not complete**" ;;
+          esac
+
+          {
+            printf '%s' "$title"
+            [ -n "$headline_md" ] && printf ' — %s' "$headline_md"
+            printf '\n\n'
+
+            if [ -s findings.md ]; then
+              cat findings.md
+            elif [ "$outcome" = go-ahead ]; then
+              echo "No risks or blockers found."
+            elif [ "$outcome" = none ]; then
+              echo "The review agent finished without recording a verdict. Nothing was published for this run — re-trigger with \`/doorway-review\`."
+            fi
+
+            printf '\n'
+            if [ -n "$url" ]; then
+              printf '[Full analysis](%s)\n' "$url"
+              if [ "$ruleoutputs_ok" != 1 ] && { [ "$outcome" = go-ahead ] || [ "$outcome" = escalated ]; }; then
+                # The page exists and is this run's, but skipped the rule
+                # blocks — same condition as the status step, on purpose.
+                echo ""
+                echo "The full analysis carries no Rule outputs section, so the check is marked as errored — the rule blocks are the review's evidence; re-trigger with \`/doorway-review\` to regenerate it."
+              fi
+            elif [ "$outcome" = go-ahead ] || [ "$outcome" = escalated ]; then
+              # A terminal verdict without its one-pager: say so on the PR
+              # rather than silently dropping the link — the reader would
+              # otherwise assume there is no deeper analysis — and say what
+              # the status step does about it. This condition and that step's
+              # are the same on purpose; a bounce owes no one-pager.
+              if [ "$onepager_stale" = 1 ]; then
+                echo "The full analysis at the expected link was written by an earlier run, not this one, so the check is marked as errored — re-trigger with \`/doorway-review\` to regenerate it."
+              else
+                echo "The full analysis this review refers to was not written to the knowledge base, so the check is marked as errored — re-trigger with \`/doorway-review\` to regenerate it."
+              fi
+            elif [ "$outcome" = none ]; then
+              printf '[Run log](%s)\n' "$RUN_URL"
+            fi
+          } > comment.md
+
+          echo "--- comment body ---"
+          cat comment.md
+
+      # Post as a NEW comment rather than editing a previous one: the thread is
+      # the audit trail, and each re-trigger is a distinct review of a distinct
+      # state. `--body-file` keeps the body off the command line entirely.
+      - name: Post the review comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api -X POST \
+            "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            -F body=@comment.md \
+            --jq .html_url
+
+      - name: Publish the review status
+        # `if: always()`: the comment step above can fail (a large body, a
+        # transient API error) and `set -e` would then skip this one, leaving the
+        # pending status `start` posted sitting on the commit for good. Every run
+        # closes its own status.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ needs.start.outputs.sha }}
+          OUTCOME: ${{ steps.render.outputs.outcome }}
+          HEADLINE: ${{ steps.render.outputs.headline }}
+          URL: ${{ steps.render.outputs.url }}
+          ONEPAGER_OK: ${{ steps.render.outputs.onepager_ok }}
+          RULEOUTPUTS_OK: ${{ steps.render.outputs.ruleoutputs_ok }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SHA:-}" ]; then
+            echo "No PR head sha resolved — no status to publish."
+            exit 0
+          fi
+
+          case "$OUTCOME" in
+            go-ahead)  state=success; fallback="Architecture review passed" ;;
+            bounce)    state=failure; fallback="changes requested — see review comment" ;;
+            escalated) state=pending; fallback="awaiting tech lead decision" ;;
+            *)         state=error;   fallback="Review agent posted no verdict — see run log, then re-trigger /doorway-review" ;;
+          esac
+
+          # A terminal verdict owes a one-pager written by THIS run — it is
+          # where the rule checks, the evidence table and the lead's approval
+          # instrument live. A run that wrote the verdict and stopped, linked
+          # nothing (or something off-site), or left an earlier run's page in
+          # place has not finished reviewing; publishing it green would reward
+          # exactly that, run after run. Only a verified page — or a knowledge
+          # base that could not be asked — keeps the verdict's own state. The
+          # verdict stays visible in the comment; the check says "incomplete".
+          if [ "$OUTCOME" = go-ahead ] || [ "$OUTCOME" = escalated ]; then
+            if [ "${ONEPAGER_OK:-0}" != 1 ]; then
+              state=error
+              fallback="review incomplete — no one-pager written by this run; re-trigger /doorway-review"
+            elif [ "${RULEOUTPUTS_OK:-1}" != 1 ]; then
+              # The page is this run's but carries no Rule outputs section —
+              # the verbatim rule blocks are the review's evidence, and a page
+              # without them is a summary. Generic on purpose: WHICH rules and
+              # their shapes live in the knowledge base, never here.
+              state=error
+              fallback="review incomplete — one-pager has no Rule outputs section; re-trigger /doorway-review"
+            fi
+          fi
+
+          description="${HEADLINE:-}"
+          if [ "$state" = "error" ] || [ -z "$description" ]; then
+            description="$fallback"
+          fi
+
+          target_url="${URL:-$RUN_URL}"
+
+          echo "Publishing doorway/architecture-review = $state ($description)"
+          gh api -X POST "repos/$REPO/statuses/$SHA" \
+            -f state="$state" \
+            -f context=doorway/architecture-review \
+            -f description="$description" \
+            -f target_url="$target_url"

@@ -1,0 +1,77 @@
+{
+  "name": "@atlan-doorway/platform-core-frontend",
+  "version": "0.18.0",
+  "description": "Open-source core UI of the Doorway platform (raw TS/TSX source): workspace explorer/viewer, branches & change requests, Library, secrets, tools, access control.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./ui": "./src/shared/components/index.ts",
+    "./index.css": "./src/index.css",
+    "./theme.css": "./src/shared/theme/index.css",
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.1.1",
+    "tailwindcss": "^4.0.0"
+  },
+  "dependencies": {
+    "@atlan-doorway/platform-shared": "workspace:*",
+    "@iconify/react": "^6.0.2",
+    "@tailwindcss/typography": "^0.5.19",
+    "@utcp/sdk": "^1.1.1",
+    "clsx": "^2.1.1",
+    "htmlparser2": "^12.0.0",
+    "jszip": "^3.10.1",
+    "lucide-react": "^1.7.0",
+    "mammoth": "^1.12.0",
+    "mermaid": "^11.16.1",
+    "pdfjs-dist": "^6.2.108",
+    "postal-mime": "^3.0.0",
+    "react-markdown": "^10.1.0",
+    "react-resizable-panels": "^4.10.0",
+    "rehype-raw": "^7.0.0",
+    "rehype-sanitize": "^6.0.0",
+    "rehype-slug": "^6.0.0",
+    "remark-frontmatter": "^5.0.0",
+    "remark-gfm": "^4.0.1",
+    "tailwind-merge": "^3.5.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "happy-dom": "^20.8.9",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-router-dom": "^7.1.1",
+    "tailwindcss": "^4.2.2",
+    "typescript": "~5.9.3",
+    "vitest": "^3.2.6"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mananaggrawal/atlan-doorway.git",
+    "directory": "packages/core-frontend"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

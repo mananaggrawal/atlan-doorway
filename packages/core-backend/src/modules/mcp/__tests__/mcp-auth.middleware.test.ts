@@ -1,0 +1,365 @@
+import { describe, expect, it, vi } from 'vitest';
+import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { createMcpAuthMiddleware } from '../mcp-auth.middleware.js';
+import type { AuthService } from '../../auth/auth.service.js';
+import type { IExternalApiKeyService } from '../../tool-auth/external-api-key.interface.js';
+import type { DoorwayOAuthProvider } from '../oauth/doorway-oauth-provider.js';
+import { InternalTokenService } from '../../tool-auth/internal-token.service.js';
+
+const RESOURCE_METADATA_URL = 'https://doorway.example/.well-known/oauth-protected-resource/api/mcp';
+
+function makeReqRes(authorization?: string) {
+  const req: any = { headers: authorization ? { authorization } : {} };
+  const setHeader = vi.fn();
+  const status = vi.fn().mockReturnThis();
+  const json = vi.fn().mockReturnThis();
+  const res: any = { setHeader, status, json };
+  const next = vi.fn();
+  return { req, res, next, setHeader, status, json };
+}
+
+function makeAuthService(verify?: (t: string) => { userId: string; email: string }) {
+  return {
+    verifyToken: vi.fn(verify ?? (() => {
+      throw new Error('invalid');
+    })),
+  } as unknown as AuthService;
+}
+
+function makeExternalApiKeyService(
+  resolve?: (
+    t: string,
+  ) => Promise<{
+    tokenId: string;
+    user: { id: string; email: string; name: string; avatarUrl?: string };
+  } | null>,
+) {
+  return {
+    looksLikeExternalApiKey: (t: string) => typeof t === 'string' && t.startsWith('doorway_'),
+    // The doorway_ path resolves the token *id* alongside the user so the tool
+    // handler can meter per-key usage against the daily cap.
+    verifyAndLoadToken: vi.fn(resolve ?? (async () => null)),
+    verifyAndLoadUser: vi.fn(),
+    mint: vi.fn(),
+    listForUser: vi.fn(),
+    revoke: vi.fn(),
+  } as unknown as IExternalApiKeyService;
+}
+
+function makeOAuthProvider(
+  verify?: (t: string) => Promise<{ extra?: Record<string, unknown> }>,
+) {
+  return {
+    looksLikeAccessToken: (t: string) => typeof t === 'string' && t.startsWith('doorway-mcp_'),
+    verifyAccessToken: vi.fn(
+      verify ??
+        (async () => {
+          throw new InvalidTokenError('unknown token');
+        }),
+    ),
+  } as unknown as DoorwayOAuthProvider;
+}
+
+function makeMw(
+  overrides: {
+    auth?: AuthService;
+    keys?: IExternalApiKeyService;
+    oauth?: DoorwayOAuthProvider;
+    internal?: InternalTokenService;
+  } = {},
+) {
+  return createMcpAuthMiddleware(
+    overrides.auth ?? makeAuthService(),
+    overrides.keys ?? makeExternalApiKeyService(),
+    overrides.oauth ?? makeOAuthProvider(),
+    RESOURCE_METADATA_URL,
+    overrides.internal ?? new InternalTokenService({ secret: 'test-secret-32-bytes-long-enough!!' }),
+  );
+}
+
+describe('createMcpAuthMiddleware', () => {
+  it('401s with a resource_metadata WWW-Authenticate challenge when the Authorization header is missing', async () => {
+    const mw = makeMw();
+    const { req, res, next, setHeader, status } = makeReqRes();
+
+    await mw(req, res, next);
+
+    // RFC 9728: the challenge must point OAuth-capable clients at the
+    // protected-resource metadata so they can discover the AS.
+    expect(setHeader).toHaveBeenCalledWith(
+      'WWW-Authenticate',
+      expect.stringContaining(`resource_metadata="${RESOURCE_METADATA_URL}"`),
+    );
+    expect(status).toHaveBeenCalledWith(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('accepts a lowercase "bearer " scheme per RFC 7235 (case-insensitive match)', async () => {
+    const externalApiKeys = makeExternalApiKeyService(async () => ({
+      tokenId: 'tok-9',
+      user: { id: 'user-9', email: 'c@example.com', name: 'Carol' },
+    }));
+    const mw = makeMw({ keys: externalApiKeys });
+    const { req, res, next } = makeReqRes('bearer doorway_abc');
+
+    await mw(req, res, next);
+
+    expect(req.userId).toBe('user-9');
+    expect(next).toHaveBeenCalled();
+    // Token extraction must not silently include the scheme prefix.
+    expect((externalApiKeys as any).verifyAndLoadToken).toHaveBeenCalledWith('doorway_abc');
+  });
+
+  it('401s on a non-Bearer scheme', async () => {
+    const mw = makeMw();
+    const { req, res, next, status } = makeReqRes('Basic abc:123');
+
+    await mw(req, res, next);
+
+    expect(status).toHaveBeenCalledWith(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('resolves a doorway_ connection key via ExternalApiKeyService and attaches userId/email/externalApiKeyId', async () => {
+    const externalApiKeys = makeExternalApiKeyService(async () => ({
+      tokenId: 'tok-7',
+      user: { id: 'user-7', email: 'alice@example.com', name: 'Alice' },
+    }));
+    const auth = makeAuthService();
+    const mw = makeMw({ auth, keys: externalApiKeys });
+    const { req, res, next } = makeReqRes('Bearer doorway_abc');
+
+    await mw(req, res, next);
+
+    expect(req.userId).toBe('user-7');
+    expect(req.userEmail).toBe('alice@example.com');
+    expect(req.externalApiKeyId).toBe('tok-7');
+    expect(next).toHaveBeenCalled();
+    // JWT path must NOT be touched for a doorway_ token — otherwise a leaked
+    // key would also get a JWT-verify error logged.
+    expect((auth as any).verifyToken).not.toHaveBeenCalled();
+  });
+
+  it('401s with WWW-Authenticate when a doorway_ token is unknown or revoked', async () => {
+    const mw = makeMw({ keys: makeExternalApiKeyService(async () => null) });
+    const { req, res, next, setHeader, status, json } = makeReqRes('Bearer doorway_revoked');
+
+    await mw(req, res, next);
+
+    expect(setHeader).toHaveBeenCalledWith(
+      'WWW-Authenticate',
+      expect.stringContaining('Bearer'),
+    );
+    expect(status).toHaveBeenCalledWith(401);
+    expect(json).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.stringMatching(/connection key/i) }),
+    );
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('500s — not 401s — when the token service throws (DB outage etc.)', async () => {
+    const externalApiKeys = makeExternalApiKeyService(async () => {
+      throw new Error('db down');
+    });
+    const mw = makeMw({ keys: externalApiKeys });
+    const { req, res, next, status } = makeReqRes('Bearer doorway_abc');
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await mw(req, res, next);
+
+    expect(status).toHaveBeenCalledWith(500);
+    expect(next).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it('resolves an OAuth access token via the provider and attaches userId/email WITHOUT externalApiKeyId', async () => {
+    const auth = makeAuthService();
+    const externalApiKeys = makeExternalApiKeyService();
+    const oauth = makeOAuthProvider(async () => ({
+      extra: { userId: 'user-5', userEmail: 'eve@example.com' },
+    }));
+    const mw = makeMw({ auth, keys: externalApiKeys, oauth });
+    const { req, res, next } = makeReqRes('Bearer doorway-mcp_token123');
+
+    await mw(req, res, next);
+
+    expect(req.userId).toBe('user-5');
+    expect(req.userEmail).toBe('eve@example.com');
+    // OAuth sessions are unmetered like JWT sessions — no connection key id.
+    expect(req.externalApiKeyId).toBeUndefined();
+    expect(next).toHaveBeenCalled();
+    // Neither the connection-key nor the JWT path may see this token shape.
+    expect((externalApiKeys as any).verifyAndLoadToken).not.toHaveBeenCalled();
+    expect((auth as any).verifyToken).not.toHaveBeenCalled();
+  });
+
+  it('401s with the discovery challenge when the OAuth token is invalid/expired/revoked', async () => {
+    const mw = makeMw();
+    const { req, res, next, setHeader, status } = makeReqRes('Bearer doorway-mcp_expired');
+
+    await mw(req, res, next);
+
+    expect(setHeader).toHaveBeenCalledWith(
+      'WWW-Authenticate',
+      expect.stringContaining('resource_metadata='),
+    );
+    expect(status).toHaveBeenCalledWith(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('500s — not 401s — when OAuth verification fails on a backend error', async () => {
+    const oauth = makeOAuthProvider(async () => {
+      throw new Error('db down');
+    });
+    const mw = makeMw({ oauth });
+    const { req, res, next, status } = makeReqRes('Bearer doorway-mcp_token');
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await mw(req, res, next);
+
+    expect(status).toHaveBeenCalledWith(500);
+    expect(next).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it('falls through to JWT verification when the token is not a connection key or OAuth token', async () => {
+    const auth = makeAuthService(() => ({ userId: 'user-3', email: 'bob@example.com' }));
+    const externalApiKeys = makeExternalApiKeyService();
+    const mw = makeMw({ auth, keys: externalApiKeys });
+    const { req, res, next } = makeReqRes('Bearer eyJhbGciOiJIUzI1NiJ9.xyz');
+
+    await mw(req, res, next);
+
+    expect(req.userId).toBe('user-3');
+    expect(req.userEmail).toBe('bob@example.com');
+    expect(next).toHaveBeenCalled();
+    // Make sure we didn't try the external-api-key path for a JWT.
+    expect((externalApiKeys as any).verifyAndLoadToken).not.toHaveBeenCalled();
+  });
+
+  it('401s when JWT verification fails', async () => {
+    const auth = makeAuthService(() => {
+      throw new Error('expired');
+    });
+    const mw = makeMw({ auth });
+    const { req, res, next, status } = makeReqRes('Bearer not.a.real.jwt');
+
+    await mw(req, res, next);
+
+    expect(status).toHaveBeenCalledWith(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+
+  /**
+   * The internal-token branch: server-minted only (createSession's loopback
+   * bearer, the /mcp/local-token exchange). doorway-mcp's OAuth mode sends one
+   * here when it registers this endpoint as its remote manual — the exact hop
+   * that failed while this surface refused the shape.
+   */
+  describe('internal tokens', () => {
+    const internal = new InternalTokenService({ secret: 'test-secret-32-bytes-long-enough!!' });
+
+    it('accepts a live internal token and resolves the user', async () => {
+      const token = internal.mint({ userId: 'user-7', externalProxy: true }, 60_000);
+      const auth = makeAuthService();
+      (auth.getUserById as ReturnType<typeof vi.fn>) = vi.fn(async () => ({
+        id: 'user-7',
+        email: 'seven@example.com',
+      }));
+      const mw = makeMw({ internal, auth });
+      const { req, res, next } = makeReqRes(`Bearer ${token}`);
+      await mw(req, res, next);
+      expect(next).toHaveBeenCalled();
+      expect(req.userId).toBe('user-7');
+      expect(req.userEmail).toBe('seven@example.com');
+    });
+
+    it('401s an expired internal token', async () => {
+      const past = new InternalTokenService({
+        secret: 'test-secret-32-bytes-long-enough!!',
+        now: () => Date.now() - 120_000,
+      });
+      const token = past.mint({ userId: 'user-7', externalProxy: true }, 60_000);
+      const mw = makeMw({ internal });
+      const { req, res, next, status } = makeReqRes(`Bearer ${token}`);
+      await mw(req, res, next);
+      expect(next).not.toHaveBeenCalled();
+      expect(status).toHaveBeenCalledWith(401);
+    });
+
+    it('401s an internal token whose user no longer exists', async () => {
+      const token = internal.mint({ userId: 'ghost', externalProxy: true }, 60_000);
+      const auth = makeAuthService();
+      (auth.getUserById as ReturnType<typeof vi.fn>) = vi.fn(async () => null);
+      const mw = makeMw({ internal, auth });
+      const { req, res, next, status } = makeReqRes(`Bearer ${token}`);
+      await mw(req, res, next);
+      expect(next).not.toHaveBeenCalled();
+      expect(status).toHaveBeenCalledWith(401);
+    });
+
+    /**
+     * Only the externalProxy shape may be an MCP caller. A plain in-process
+     * internal token — the per-run credential the agent factory mints for its
+     * own code-mode client — is a loopback-surface credential, and admitting
+     * it here would let it open an MCP session (createSession would even mint
+     * it a fresh externalProxy bearer, upgrading it).
+     */
+    it('401s a VALID internal token that lacks the externalProxy claim', async () => {
+      const token = internal.mint({ userId: 'user-7' }, 60_000);
+      const auth = makeAuthService();
+      (auth.getUserById as ReturnType<typeof vi.fn>) = vi.fn(async () => ({
+        id: 'user-7',
+        email: 'seven@example.com',
+      }));
+      const mw = makeMw({ internal, auth });
+      const { req, res, next, status } = makeReqRes(`Bearer ${token}`);
+      await mw(req, res, next);
+      expect(next).not.toHaveBeenCalled();
+      expect(status).toHaveBeenCalledWith(401);
+      // Rejected before any user lookup — the shape alone disqualifies it.
+      expect(auth.getUserById).not.toHaveBeenCalled();
+    });
+
+    /**
+     * `verify` answers null for the invalid cases it can see coming, but a
+     * malformed token of plausible shape can still THROW from inside it
+     * (e.g. `timingSafeEqual` on same-length strings whose byte lengths
+     * differ). That is the caller's bad token — a clean 401, never a 500 or
+     * an unhandled throw.
+     */
+    it('401s — not 500s — when verify throws on a malformed token', async () => {
+      const throwing = {
+        looksLikeInternalToken: (t: string) => t.startsWith('doorway-int_'),
+        verify: () => {
+          throw new RangeError('Input buffers must have the same byte length');
+        },
+      } as unknown as InternalTokenService;
+      const mw = makeMw({ internal: throwing });
+      const { req, res, next, status } = makeReqRes('Bearer doorway-int_bödy.sïg');
+      await mw(req, res, next);
+      expect(next).not.toHaveBeenCalled();
+      expect(status).toHaveBeenCalledWith(401);
+    });
+
+    /**
+     * The real-token spelling of the throw above: a signature of the SAME
+     * string length whose non-ASCII characters change its BYTE length makes
+     * `timingSafeEqual` throw inside the real `verify` — proof the guard is
+     * needed against the genuine service, not only a mock.
+     */
+    it('401s a real token whose forged signature makes verify throw', async () => {
+      const token = internal.mint({ userId: 'user-7', externalProxy: true }, 60_000);
+      const dot = token.lastIndexOf('.');
+      const sig = token.slice(dot + 1);
+      // Same string LENGTH, different byte length: 'é' is two UTF-8 bytes.
+      const forged = `${token.slice(0, dot + 1)}é${sig.slice(1)}`;
+      const mw = makeMw({ internal });
+      const { req, res, next, status } = makeReqRes(`Bearer ${forged}`);
+      await mw(req, res, next);
+      expect(next).not.toHaveBeenCalled();
+      expect(status).toHaveBeenCalledWith(401);
+    });
+  });
+});

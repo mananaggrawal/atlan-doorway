@@ -1,0 +1,70 @@
+name: Test
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  # Lets another workflow run this suite as a gate on its own trigger, on the
+  # exact commit it is about to act on. Nothing calls it today — the image
+  # publish that did was removed — but a release or deploy workflow that needs
+  # "only tested commits ship" should call this rather than restate the suite.
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Building and testing a fork PR runs that contributor's code on the runner
+    # — unavoidable, and fine, because the run holds nothing worth stealing: no
+    # secrets, and GitHub forces a read-only token on fork PRs anyway. Stating
+    # the scope here keeps that true if the repo-wide default workflow
+    # permission is ever flipped back to read/write in settings.
+    permissions:
+      contents: read
+    # Actions are pinned to reviewed commit SHAs (release tag alongside each):
+    # this suite is what says a commit is good, so a moved or compromised tag
+    # must not be able to tamper with the workspace that decides that.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 10
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # 22 is the minimum for isolated-vm@6, which is a transitive dep of
+          # @utcp/code-mode and won't compile against Node 20's V8 headers
+          # (missing `v8::SourceLocation`). engines pins >=22 <23 (native ABI).
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Licence policy gate. Fails on any dependency that offers no permissive
+      # licence (GPL/AGPL/SSPL/…) or declares one we have not classified, so a
+      # new dep can't quietly put copyleft into a shipped artifact. `pnpm build`
+      # runs the same check, but as a separate step ahead of it the failure is
+      # unambiguous and costs no compile time.
+      - run: pnpm run notices:check
+
+      - run: pnpm build
+
+      # `pnpm build` already typechecks the packages whose build IS `tsc`
+      # (shared, mcp-core, core-backend, doorway-mcp). Three are not covered by
+      # it: core-frontend and apps/server have no build step, and apps/web
+      # builds with vite, which does not typecheck. A type error in any of
+      # those reached dev unnoticed until someone ran tsc locally. After
+      # `pnpm build` so the cross-package `dist/` types it resolves exist.
+      - run: pnpm typecheck
+
+      - run: pnpm test
+
+      # Design-system ratchet. The UI is migrating onto semantic tokens, so a
+      # hard ban would fail against the remaining ~520 off-system call sites.
+      # This only fails when the count goes UP — i.e. when new off-system
+      # values are introduced. slate is already at 0, so for that rule the
+      # ratchet is a hard ban. Needed because `--color-slate-*: initial`
+      # fails silently:
+      # Tailwind emits no rule for an unknown utility, so a stale class is a
+      # no-op rather than a build error.
+      - run: pnpm ds:check

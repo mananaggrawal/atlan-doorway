@@ -1,0 +1,393 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Check, Trash2, Eye, ChevronDown, X } from 'lucide-react';
+import type { PendingChange } from '@atlan-doorway/platform-shared';
+import { useReview } from '../state/review.context';
+import { useWorkspace } from '../../workspace/state/workspace.context';
+import {
+  useFileNav,
+  useNodeIdNav,
+  stripJunkBeforeKbDir,
+} from '../../workspace/routing/kb-routes';
+import { useWorkspaceImageResolver } from '../../workspace/hooks/useWorkspaceImageResolver';
+import { pluginOfPath, DEFAULT_BRANCH } from '@atlan-doorway/platform-shared';
+import { cn } from '../../../lib/utils';
+import { DOCUMENT_COLUMN, documentGutters } from '../../../shared/theme/measure';
+import { ReviewFileRow } from './ReviewFileRow';
+import { DiffViewer } from './DiffViewer';
+import { MarkdownDiffViewer } from './MarkdownDiffViewer';
+import { BinaryChangePlaceholder } from './BinaryChangePlaceholder';
+
+function isMarkdownPath(p: string): boolean {
+  return /\.md$/i.test(p);
+}
+
+/**
+ * Whether a review-session path is a skill or tool — anything under `Plugins/`.
+ *
+ * The paths in a review session are WORKSPACE-relative: the diff module
+ * resolves them against the workspace directory, so they arrive carrying the
+ * KB clone as their first segment (`knowledge-base/Plugins/GTM/x/SKILL.md`).
+ * `pluginOfPath` wants them REPO-relative, and `stripJunkBeforeKbDir` does not
+ * get there on its own — it only drops junk BEFORE the kb dir and keeps the
+ * segment itself, so it returns an already-well-formed path unchanged. Asking
+ * `pluginOfPath` about the workspace-relative form gets `null` for every path,
+ * plugin or not, which is a check that silently never fires.
+ *
+ * Exported so it can be tested directly. The behaviour it guards lives behind
+ * a dropdown the component tests cannot open, and a first attempt at covering
+ * it through the UI passed with the guard deleted.
+ */
+export function isPluginItemPath(path: string, kbDirName: string | null): boolean {
+  const withoutJunk = stripJunkBeforeKbDir(path, kbDirName);
+  const repoRelative =
+    kbDirName && withoutJunk.startsWith(`${kbDirName}/`)
+      ? withoutJunk.slice(kbDirName.length + 1)
+      : withoutJunk;
+  return pluginOfPath(repoRelative) !== null;
+}
+
+/**
+ * Whether selecting `change` should also open its file beside the diff.
+ *
+ * The whole decision in one place, and exported, because the call site sits
+ * behind a dropdown the component harness cannot open — everything asserted
+ * about it through the UI passed with the guard deleted.
+ *
+ * Two reasons not to:
+ *   - DELETED: navigating to a missing path lands FileRoute on its
+ *     file-not-found state.
+ *   - a plugin item ON THE DEFAULT BRANCH: that URL is a library location, so
+ *     opening it switches the whole shell to Skills & Tools and the panel,
+ *     the diff and the review vanish because someone clicked a row in a list.
+ *
+ * The branch is part of it, and this is the easy half to get wrong: only the
+ * DEFAULT branch's `Plugins/` URLs are library locations (`isLibraryLocation`
+ * tests `segments[1] === DEFAULT_BRANCH`). The same skill on a draft branch
+ * opens in Knowledge like any other file and switches nothing, so refusing to
+ * open it there would cost the context this call exists to give and buy
+ * nothing.
+ *
+ * `DEFAULT_BRANCH` is read here rather than captured at module scope — it is
+ * a live binding configured during boot.
+ */
+export function shouldOpenBesideDiff(input: {
+  kind: PendingChange['kind'];
+  path: string;
+  kbDirName: string | null;
+  branch: string | null;
+}): boolean {
+  if (input.kind === 'deleted') return false;
+  const switchesApp = input.branch === DEFAULT_BRANCH && isPluginItemPath(input.path, input.kbDirName);
+  return !switchesApp;
+}
+
+function basename(p: string): string {
+  const i = p.lastIndexOf('/');
+  return i >= 0 ? p.slice(i + 1) : p;
+}
+
+function kindLabel(kind: PendingChange['kind']): string {
+  switch (kind) {
+    case 'added': return 'Added';
+    case 'deleted': return 'Deleted';
+    case 'renamed': return 'Renamed';
+    case 'modified': return 'Modified';
+  }
+}
+
+/**
+ * Review panel for pending agent changes. **Opt-in, not a takeover.** The
+ * caller (FileViewer) decides when to mount it — the user opens it from the
+ * review badge and can dismiss it via `onClose`. It no longer auto-mounts on
+ * the existence of changes; that "existence" fact drives the badge instead,
+ * keeping "are there changes" and "is the panel open" as separate concerns.
+ *
+ * Layout: a single top bar with a file-picker dropdown + global actions,
+ * then the diff fills the rest. The dropdown replaces the earlier left
+ * sidebar so the diff always gets full width — important on mobile where
+ * the sidebar was eating most of the screen.
+ */
+export function ReviewPanel({ onClose }: { onClose?: () => void }) {
+  const review = useReview();
+  const { refreshFileTree, kbDirName, workspaceId } = useWorkspace();
+  const { openFile, openLink } = useFileNav();
+  // Links inside a rendered diff. Both resolvers navigate relative to
+  // `git.status.branch`, which is CORRECT here and only here: this panel
+  // reviews the agent's uncommitted changes on the branch you are already
+  // standing on, so "the diff's branch" and "the current branch" are the same
+  // thing. (The change-request dialog is not in that position, which is why it
+  // passes no resolvers — see the comment at its MarkdownDiffViewer call.)
+  const { openNodeId } = useNodeIdNav();
+  const diffPath = review.fileDiff?.path ?? '';
+  // Resolved against the diffed file by `openLink`: decoded, an absolute URL
+  // keeping its own branch. The same grammar MarkdownRenderer uses.
+  const openDiffLink = useCallback(
+    (href: string) => openLink(href, diffPath),
+    [openLink, diffPath],
+  );
+  // Images inside a rendered diff, bound to the CHECKED-OUT workspace for the
+  // reason above: the working tree IS the diff's new state, so an image the
+  // agent added is on disk and can be shown. The viewer applies this to the
+  // unchanged and added sides only; a removed image is named, never fetched.
+  // The revision keeps the panel current when the agent replaces a picture
+  // while it is open.
+  const resolveDiffImage = useWorkspaceImageResolver(workspaceId, diffPath);
+  const [busy, setBusy] = useState(false);
+  // `busy` alone is not re-entrant-safe: two rapid clicks (or a click + a
+  // keyboard activation of the same button) can both read `busy === false`
+  // before React schedules the state update. A synchronous ref flips the
+  // lock in the same tick so the second invocation sees the first one.
+  const busyRef = useRef(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  // Default action scope is the single selected file. The "Apply to all"
+  // checkbox (off by default) widens Accept/Delete to every pending change.
+  const [applyToAll, setApplyToAll] = useState(false);
+
+  const { session, selectedPath, fileDiff, isLoadingDiff, selectPath } = review;
+
+  // Auto-select the first change whenever the selection is empty but changes exist.
+  // Keeps the diff pane populated after an accept/reject collapses the selected row.
+  useEffect(() => {
+    if (!session || session.changes.length === 0) return;
+    if (selectedPath) return;
+    const first = session.changes[0];
+    selectPath(first.path);
+  }, [session, selectedPath, selectPath]);
+
+  // Close the picker on outside click / ESC.
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const onMouseDown = (e: MouseEvent) => {
+      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
+        setPickerOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPickerOpen(false);
+    };
+    document.addEventListener('mousedown', onMouseDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [pickerOpen]);
+
+  const handleSelect = useCallback(
+    async (path: string) => {
+      setPickerOpen(false);
+      await selectPath(path);
+      // Also surface the file in the editor so the user can see context
+      // alongside the diff — unless doing so would take the reader somewhere
+      // they did not ask to go. See `shouldOpenBesideDiff`.
+      const change = session?.changes.find((c) => c.path === path);
+      if (
+        change &&
+        shouldOpenBesideDiff({
+          kind: change.kind,
+          path,
+          kbDirName,
+          branch: session?.branchName ?? null,
+        })
+      ) {
+        openFile(path);
+      }
+    },
+    [selectPath, openFile, session, kbDirName],
+  );
+
+  const withBusy = useCallback(
+    async (fn: () => Promise<void>) => {
+      if (busyRef.current) return;
+      busyRef.current = true;
+      setBusy(true);
+      try {
+        await fn();
+        // Any accept/reject changes disk state, so refresh the tree in case
+        // files were added/removed.
+        await refreshFileTree();
+      } finally {
+        busyRef.current = false;
+        setBusy(false);
+      }
+    },
+    [refreshFileTree],
+  );
+
+  if (!session || session.changes.length === 0) return null;
+
+  const count = session.changes.length;
+  const selected = session.changes.find((c) => c.path === selectedPath);
+  const selectedLabel = selected ? basename(selected.path) : 'Select a file';
+  const selectedKind = selected ? kindLabel(selected.kind) : null;
+
+  return (
+    <div className="absolute inset-0 z-20 flex flex-col bg-white">
+      <div className="min-h-10 border-b border-line flex flex-wrap items-center px-3 py-1.5 gap-2 shrink-0">
+        <Eye size={14} className="text-emerald-600 shrink-0" />
+        <span className="text-sm font-medium text-ink shrink-0">
+          Review agent changes
+        </span>
+        <span className="text-xs text-ink-muted shrink-0">
+          {count} file{count === 1 ? '' : 's'} pending
+        </span>
+
+        <div ref={pickerRef} className="relative flex-1 min-w-[10rem] max-w-md">
+          <button
+            type="button"
+            onClick={() => setPickerOpen((v) => !v)}
+            aria-haspopup="listbox"
+            aria-expanded={pickerOpen}
+            className="w-full flex items-center gap-2 px-2.5 py-1 rounded border border-line-strong bg-white hover:bg-hover text-left"
+          >
+            <span className="text-xs text-ink truncate flex-1" title={selected?.path}>
+              {selectedLabel}
+            </span>
+            {selectedKind && (
+              <span className="text-[10px] uppercase tracking-wider text-ink-muted shrink-0">
+                {selectedKind}
+              </span>
+            )}
+            <ChevronDown
+              size={12}
+              className={`text-ink-muted shrink-0 transition-transform ${pickerOpen ? 'rotate-180' : ''}`}
+            />
+          </button>
+
+          {pickerOpen && (
+            <div
+              role="listbox"
+              className="absolute left-0 right-0 top-full mt-1 max-h-[60vh] overflow-y-auto bg-white border border-line rounded-md shadow-xl z-30 p-1 space-y-1"
+            >
+              {session.changes.map((change) => (
+                <ReviewFileRow
+                  key={`${change.kind}:${change.oldPath ?? ''}:${change.path}`}
+                  change={change}
+                  active={selectedPath === change.path}
+                  busy={busy}
+                  onSelect={() => handleSelect(change.path)}
+                  onAccept={() => withBusy(() => review.acceptOne(change.path))}
+                  onReject={() => review.rejectOne(change.path)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+
+        <button
+          type="button"
+          disabled={busy || (!applyToAll && !selected)}
+          onClick={() =>
+            withBusy(() =>
+              applyToAll
+                ? review.rejectAll()
+                : selected ? review.rejectOne(selected.path) : Promise.resolve(),
+            )
+          }
+          title={applyToAll ? 'Delete every pending change. Restore the originals' : 'Delete this change. Restore the original'}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium text-ink hover:text-red-700 hover:bg-red-100 disabled:opacity-40"
+        >
+          <Trash2 size={12} />
+          Delete
+        </button>
+        <button
+          type="button"
+          disabled={busy || (!applyToAll && !selected)}
+          onClick={() =>
+            withBusy(() =>
+              applyToAll
+                ? review.acceptAll()
+                : selected ? review.acceptOne(selected.path) : Promise.resolve(),
+            )
+          }
+          title={applyToAll ? 'Accept every pending change' : 'Accept this change'}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium bg-emerald-700 hover:bg-emerald-600 text-white disabled:opacity-40"
+        >
+          <Check size={12} />
+          Accept
+        </button>
+        <label className="flex items-center gap-1.5 text-xs text-ink select-none shrink-0 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={applyToAll}
+            onChange={(e) => setApplyToAll(e.target.checked)}
+            disabled={busy}
+            className="cursor-pointer"
+          />
+          Apply to all
+        </label>
+        {onClose && (
+          <button
+            type="button"
+            onClick={onClose}
+            title="Close review: changes stay pending"
+            aria-label="Close review"
+            className="ml-1 p-1 rounded text-ink-muted hover:text-ink hover:bg-hover shrink-0"
+          >
+            <X size={16} />
+          </button>
+        )}
+      </div>
+
+      <div className="flex-1 min-w-0 min-h-0">
+        {isLoadingDiff && (
+          <div className="h-full flex items-center justify-center text-xs text-ink-muted">
+            Loading diff…
+          </div>
+        )}
+        {!isLoadingDiff && !fileDiff && (
+          <div className="h-full flex items-center justify-center text-xs text-ink-muted">
+            Select a file to see the diff.
+          </div>
+        )}
+        {!isLoadingDiff && fileDiff && fileDiff.isBinary && (
+          <BinaryChangePlaceholder payload={fileDiff} />
+        )}
+        {!isLoadingDiff && fileDiff && !fileDiff.isBinary && (
+          isMarkdownPath(fileDiff.path) ? (
+            // Panel-width SCROLLER, measured INNER column.
+            //
+            // The scroller has to be the outer box: when the centred column
+            // scrolled instead, the gutters either side sat outside its hit
+            // area and the wheel did nothing over them — a dead margin on
+            // exactly the wide screens the measure exists for.
+            //
+            // With the outer scrolling, the inner column can carry the real
+            // Knowledge contract: `DOCUMENT_COLUMN` + `documentGutters`, which
+            // bundles the 40px sides AND the 110px bottom rhythm. Both now sit
+            // INSIDE the scroller, where they belong — the earlier version had
+            // to skip the gutters entirely because that bottom padding would
+            // have become permanent dead space below a child-owned scroll.
+            // The line lands at 800px, the same as the document two clicks
+            // away, rather than the 848px approximation.
+            //
+            // `scroll={false}` is what makes it possible: two nested
+            // `h-full overflow-auto` boxes leave the outer unable to scroll
+            // and stack both paddings.
+            //
+            // `roomy` is false — this panel covers the viewer, not the nav, so
+            // the file tree is still on screen beside it.
+            <div className="h-full overflow-auto bg-white">
+              <div className={cn(DOCUMENT_COLUMN, documentGutters(false))}>
+                <MarkdownDiffViewer
+                  payload={fileDiff}
+                  onOpenFile={openDiffLink}
+                  onOpenNodeId={openNodeId}
+                  resolveImage={resolveDiffImage}
+                  scroll={false}
+                />
+              </div>
+            </div>
+          ) : (
+            // Left full-bleed on purpose. This is the marked-SOURCE view for
+            // yaml, scripts and config, where a line is a line of code and
+            // wrapping it to a prose measure helps nobody — the same call
+            // `getRendererLayout` makes for those types in the file viewer.
+            <DiffViewer payload={fileDiff} />
+          )
+        )}
+      </div>
+    </div>
+  );
+}

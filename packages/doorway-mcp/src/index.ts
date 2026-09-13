@@ -1,0 +1,67 @@
+/**
+ * @atlan-doorway/doorway-mcp — a Doorway workspace as a local MCP server.
+ *
+ * The hosted endpoint cannot call a tool that only exists on your machine: a
+ * `.tool` marked `remote: false` (an MCP server on localhost, an internal HTTP
+ * service) is skipped there and only named by `list_local_tools`. This process
+ * closes that gap by being where those tools can actually run, while still
+ * serving everything the hosted endpoint serves.
+ *
+ * It does that by registering the deployment's own MCP endpoint as ONE UTCP
+ * manual alongside the local-only ones. So the remote tools are not
+ * reimplemented here, and — the part that matters — they still EXECUTE on the
+ * server: a `.tool` that reaches Notion or a vendor API resolves its `${VAR}`s
+ * in the process holding the client, and for those tools that process remains
+ * the deployment's, with its Secrets Vault and its completed OAuth sign-ins.
+ * Only the local-only tools run here. Their credentials come from the same
+ * Secrets Vault, resolved through one narrow route: the request names a
+ * MANUAL, never a variable, and the deployment answers with exactly what that
+ * manual's `.tool` declares — so the knowledge base is the allowlist and no
+ * caller can widen it. What arrives is bound to that manual's namespace and is
+ * substituted into a tool invocation; it is never returned to an agent.
+ * `process.env` remains the fallback tier underneath, so a tool provisioned
+ * the old way (in the MCP client config) keeps working.
+ *
+ * Normally run as a command (`npx @atlan-doorway/doorway-mcp`); the pieces are
+ * exported for embedding it in another process.
+ */
+export { type DoorwayMcpConfig, type ResolvedCliConfig, ConfigError, resolveConfig, USAGE } from './config.js';
+export {
+  DeploymentError,
+  resolveMcpUrl,
+  resolveDeployment,
+  fetchAgentInstructions,
+  type ResolvedDeployment,
+  fetchAllManuals,
+  fetchLocalOnlyManuals,
+  fetchLocalToolVariables,
+  type LocalManualInfo,
+  type LocalToolVariables,
+} from './deployment.js';
+export {
+  DoorwayLocalVariableLoader,
+  bindLocalVariableResolver,
+  resetLocalVariableResolver,
+  registerLocalVariableLoader,
+  localVariableLoaderConfig,
+} from './local-variables.js';
+export {
+  OAuthError,
+  discoverAuthServer,
+  readStoredCredentials,
+  writeStoredCredentials,
+  oauthStorePath,
+  refreshAccessToken,
+  authorizeInBrowser,
+  openInBrowser,
+  exchangeForLocalToken,
+  establishOAuthConfig,
+  type AuthServerEndpoints,
+  type StoredOAuthCredentials,
+  type BrowserFlowOptions,
+  type BrowserFlowResult,
+  type LocalTokenGrant,
+  type OAuthModeOptions,
+} from './oauth.js';
+export { REMOTE_MANUAL_NAME, remoteManualTemplate, localManualTemplates } from './manuals.js';
+export { createDoorwayMcpServer, listedTools, type DoorwayMcpHandle } from './server.js';
