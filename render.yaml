@@ -4,18 +4,27 @@
 # instance, and generated secrets. After the first deploy, set DOMAIN to the
 # hostname Render gives you (e.g. atlan-doorway.onrender.com) so OAuth
 # redirects and cookie origins are built correctly, then redeploy.
+#
+# Both plans below are set to `free` so a first try costs nothing. Two real
+# limits come with that: the free Postgres instance is deleted 30 days after
+# creation (14-day grace period to upgrade first), and the free web service
+# spins down after 15 minutes idle (about a minute to wake back up, and its
+# filesystem resets on every redeploy — fine here, since all real state is in
+# Postgres). For a team actually relying on this, bump both `plan:` values
+# below to a paid tier (e.g. `0.5c-1g` for the database, `0.5c-512mb` for the
+# web service) before or right after the first deploy.
 databases:
   - name: atlan-doorway-db
     databaseName: doorway
     user: doorway
-    plan: basic-256mb
+    plan: free
 
 services:
   - type: web
     name: atlan-doorway
     runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: starter
+    plan: free
     healthCheckPath: /api/health
     autoDeployTrigger: commit
     envVars:
