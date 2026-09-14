@@ -12,7 +12,6 @@ agent** that speaks MCP.
 This is a private repository. It's the code, not a public project — see
 below for what it does and how to try the live instance.
 
-[![Atlan Scan](http://localhost:8787/badge/uFHhgA1Gue1G.svg)](http://localhost:8787/p/uFHhgA1Gue1G)
 ---
 
 ## Try it
